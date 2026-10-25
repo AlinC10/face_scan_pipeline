@@ -1,0 +1,21 @@
+# Dependențe pentru Reconstrucție 3D, Dense Stereo și Fotogrametrie
+# Compatibil cu Windows (CUDA / CPU), Linux și Docker RunPod
+
+# 1. Deep Learning & Disparitate Neurală (CREStereo / PyTorch)
+torch>=2.1.0
+torchvision>=0.16.0
+
+# 2. Reconstrucție de Suprafață & Decimare Mesh (Open3D)
+open3d>=0.18.0
+
+# 3. Viziune Computațională & Repere Faciale 3D
+mediapipe>=0.10.14
+opencv-contrib-python>=4.8.0.76
+
+# 4. Geometrie 3D, Atlas UV & Export Multi-Format (OBJ, GLB, STL, 3MF)
+trimesh[all]>=4.0.0
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+pillow>=10.0.0
+xatlas>=0.0.9
+piexif>=1.1.3

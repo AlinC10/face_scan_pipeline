@@ -1,0 +1,16 @@
+conv
+__pycache__
+**/__pycache__
+**/__pycache__/**
+.venv
+
+to_delete
+deprecated
+output_**
+docs/extra
+docs/flame
+
+input_images
+output**
+STAGIU_CURENT.md
+plans

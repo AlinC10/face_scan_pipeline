@@ -1,0 +1,28 @@
+# Virtual environments and caches
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git and IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Local data & outputs (will be mounted at runtime)
+input_images/
+output/
+output_*/
+*.log
+to_delete/
+deprecated/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

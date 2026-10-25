@@ -1,0 +1,20 @@
+services:
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: 3d-scanner:latest
+    container_name: 3d-scanner
+    volumes:
+      - ./input_images:/app/input_images
+      - ./output:/app/output
+    environment:
+      - PYTHONUNBUFFERED=1
+    # Decomentează secțiunea deploy dacă folosești GPU NVIDIA cu nvidia-container-toolkit:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
