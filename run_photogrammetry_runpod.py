@@ -118,9 +118,10 @@ def run_photogrammetry_pipeline(
     layout_path: str | Path | None = None,
     tag_scale: float = 1.0,
     name: str = "model",
-    stop_after_stage: int = 3,
+    stop_after_stage: int = 7,
     rectify_native: bool = False,
     refine_with_features: bool = True,
+    reconstruction_mode: str = "hybrid",
 ) -> Dict[str, Any]:
     """
     Executes the multi-stage photogrammetry pipeline.
@@ -308,7 +309,115 @@ def run_photogrammetry_pipeline(
         return summary_report
 
     # =========================================================================
-    # ETAPA 4: TRIANGULARE METRICĂ & SCREENED POISSON (DEPTH 9-10)
+    # ETAPA 4 - 7: RECONSTRUCȚIE (HIBRIDĂ sau POISSON CLASIC)
+    # =========================================================================
+    if reconstruction_mode == "hybrid":
+        log.info("=" * 70)
+        log.info("ETAPA 4-7: FUZIUNE HIBRIDĂ (MEDIAPIPE PRIOR + DENSE STEREO DEFORMATION)")
+        log.info("=" * 70)
+
+        from reconstruction.hybrid_fuser import HybridFaceFuser
+        fuser = HybridFaceFuser(
+            canonical_mesh_path="assets/canonical_face_model.obj",
+            tex_size=2048,
+        )
+
+        cx = float(rect_res.Q_2k[0, 3] * -1.0) if rect_res.Q_2k is not None else float(WORKING_2K_WIDTH // 2)
+        cy = float(rect_res.Q_2k[1, 3] * -1.0) if rect_res.Q_2k is not None else float(WORKING_2K_HEIGHT // 2)
+
+        hybrid_res = fuser.fuse_and_export(
+            rect_left_2k=rect_res.rect_left_2k,
+            rect_right_2k=rect_res.rect_right_2k,
+            disparity_map_2k=disp_res.disparity_2k,
+            landmarks_0=mask_res.landmarks_cam0 if mask_res.landmarks_cam0 else [],
+            landmarks_1=mask_res.landmarks_cam1 if mask_res.landmarks_cam1 else (mask_res.landmarks_cam0 or []),
+            focal_px_2k=rect_res.effective_focal_2k,
+            baseline_mm=rect_res.baseline_mm,
+            cx=cx,
+            cy=cy,
+            output_dir=out_dir,
+        )
+
+        summary_report["artifacts"].update({k: str(v) for k, v in hybrid_res.deliverables.items()})
+        summary_report["stages_completed"].extend([
+            "stage_4_hybrid_landmark_alignment",
+            "stage_5_laplacian_depth_deformation",
+            "stage_6_winner_takes_all_texture_baking",
+            "stage_7_export_deliverables",
+        ])
+
+        total_dt = time.time() - t_pipeline_start
+        consolidated_manifest = {
+            "pair_id": ingestion_res.pair_id,
+            "reconstruction_mode": "hybrid",
+            "stages_completed": summary_report["stages_completed"],
+            "pipeline_duration_s": round(total_dt, 3),
+            "optical_parameters": {
+                "focal_length_px_2k": round(rect_res.effective_focal_2k, 2),
+                "baseline_mm": round(rect_res.baseline_mm, 2),
+                "convergence_deg": round(rect_res.convergence_deg, 2),
+                "z_rig_mm": ingestion_res.z_rig_mm,
+                "is_apriltag_calibrated": rect_res.is_apriltag_calibrated,
+            },
+            "rectification": {
+                "resolution": [WORKING_2K_WIDTH, WORKING_2K_HEIGHT],
+                "epipolar_rms_error_px": round(mask_res.epipolar_rms_error_px, 3),
+                "Q_matrix_2k": rect_res.Q_2k.tolist(),
+            },
+            "facial_masking": {
+                "face_detected_cam0": mask_res.face_detected_cam0,
+                "face_detected_cam1": mask_res.face_detected_cam1,
+                "d_median_px": round(mask_res.d_median, 2),
+                "d0_shift_px": mask_res.d0_shift,
+                "bbox_2k": [round(float(v), 1) for v in mask_res.bbox_2k],
+            },
+            "dense_disparity": {
+                "matcher_engine": disp_res.matcher_engine,
+                "valid_pixels_count": disp_res.valid_pixels_count,
+                "min_disparity_px": round(disp_res.min_disparity, 2),
+                "max_disparity_px": round(disp_res.max_disparity, 2),
+                "median_disparity_px": round(disp_res.median_disparity, 2),
+                "matcher_time_s": round(disp_res.execution_time_s, 3),
+            },
+            "hybrid_reconstruction": {
+                "ipd_metric_mm": round(hybrid_res.ipd_metric_mm, 1),
+                "high_poly_faces": hybrid_res.high_poly_faces,
+                "low_poly_faces": hybrid_res.low_poly_faces,
+                "bbox_dimensions_mm": [round(float(v), 1) for v in hybrid_res.bbox_dimensions_mm],
+                "reconstruction_time_s": round(hybrid_res.execution_time_s, 3),
+                "features": [
+                    "canonical_topology",
+                    "welded_ears",
+                    "laplacian_depth_fitting",
+                    "anti_ghosting_winner_takes_all",
+                ],
+            },
+            "artifacts": summary_report["artifacts"],
+        }
+        consolidated_path = out_dir / "photogrammetry_manifest.json"
+        with open(consolidated_path, "w", encoding="utf-8") as f:
+            json.dump(consolidated_manifest, f, indent=2)
+
+        log.info("=" * 70)
+        log.info("PIPELINE HIBRID FINALIZAT CU SUCCES în %.2f secunde.", total_dt)
+        log.info("  • High-Poly Model: %s (%d faces)", hybrid_res.high_mesh_path, hybrid_res.high_poly_faces)
+        log.info("  • Low-Poly Model: %s (%d faces, canonical UV)", hybrid_res.low_mesh_path, hybrid_res.low_poly_faces)
+        log.info(
+            "  • BBox Real Metric: %.1f x %.1f x %.1f mm",
+            hybrid_res.bbox_dimensions_mm[0],
+            hybrid_res.bbox_dimensions_mm[1],
+            hybrid_res.bbox_dimensions_mm[2],
+        )
+        log.info("  • 8 Deliverables: OBJ (High/Low), GLB Draco, STL, 3MF în %s", out_dir)
+        log.info("Manifest consolidat salvat în: %s", consolidated_path)
+        log.info("=" * 70)
+
+        summary_report["status"] = "success"
+        summary_report["manifest"] = str(consolidated_path)
+        return summary_report
+
+    # =========================================================================
+    # ETAPA 4: TRIANGULARE METRICĂ & SCREENED POISSON (DEPTH 9-10) [MOD CLASIC]
     # =========================================================================
     log.info("=" * 70)
     log.info("ETAPA 4: TRIANGULARE METRICĂ & SCREENED POISSON CU TRIMMING")
@@ -600,6 +709,13 @@ Examples:
         help="Stage after which to terminate execution (1 to 7; default: 7)",
     )
     parser.add_argument(
+        "--mode",
+        dest="reconstruction_mode",
+        default="hybrid",
+        choices=["hybrid", "poisson"],
+        help="Reconstruction algorithm: 'hybrid' (MediaPipe prior + dense Laplacian fitting, recommended) or 'poisson' (classical unconstrained)",
+    )
+    parser.add_argument(
         "--rectify-native",
         action="store_true",
         help="Also compute and export native 12.3MP rectified images for master texture baking",
@@ -619,6 +735,7 @@ Examples:
             name=args.name,
             stop_after_stage=args.stop_after_stage,
             rectify_native=args.rectify_native,
+            reconstruction_mode=args.reconstruction_mode,
         )
     except Exception as e:
         log.error("Pipeline failure: %s", e, exc_info=True)

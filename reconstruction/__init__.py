@@ -14,6 +14,13 @@ from .relief_generator import (
     generate_tangent_normal_map,
     apply_hair_displacement_to_mesh,
 )
+from .hybrid_fuser import (
+    HybridFaceFuser,
+    HybridFusionResult,
+    StereoLandmarkTriangulator,
+    LaplacianDepthDeformer,
+    PyramidTextureFuser,
+)
 
 __all__ = [
     "attach_ears_to_canonical_mesh",
@@ -23,4 +30,9 @@ __all__ = [
     "generate_facial_hair_height_map",
     "generate_tangent_normal_map",
     "apply_hair_displacement_to_mesh",
+    "HybridFaceFuser",
+    "HybridFusionResult",
+    "StereoLandmarkTriangulator",
+    "LaplacianDepthDeformer",
+    "PyramidTextureFuser",
 ]

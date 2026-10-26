@@ -5,16 +5,19 @@ services:
       dockerfile: Dockerfile
     image: 3d-scanner:latest
     container_name: 3d-scanner
+    entrypoint: ["/bin/bash", "/app/docker-entrypoint.sh"]
     volumes:
+      - .:/app
       - ./input_images:/app/input_images
       - ./output:/app/output
     environment:
       - PYTHONUNBUFFERED=1
-    # Decomentează secțiunea deploy dacă folosești GPU NVIDIA cu nvidia-container-toolkit:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+      - NVIDIA_VISIBLE_DEVICES=all
+    # Suport GPU NVIDIA (RTX 2060 Super și altele) via nvidia-container-toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

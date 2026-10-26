@@ -36,6 +36,8 @@ class FacialMaskResult:
     bbox_2k: Tuple[float, float, float, float]  # [xmin, ymin, xmax, ymax]
     nose_tip_coord: Tuple[float, float]    # (x, y) in Cam 0
     confidence_score: float = 1.0
+    landmarks_cam0: Optional[List[Dict[str, float]]] = None
+    landmarks_cam1: Optional[List[Dict[str, float]]] = None
 
     def save_mask(self, output_path: Union[str, Path], save_overlay: bool = True) -> Dict[str, Path]:
         """Saves binary mask and debug overlay."""
@@ -167,6 +169,8 @@ class FacialMaskExtractor:
             bbox_2k=bbox,
             nose_tip_coord=nose_coord,
             confidence_score=1.0,
+            landmarks_cam0=lm_0,
+            landmarks_cam1=lm_1 if det_1 else None,
         )
 
     def _create_face_oval_mask(

@@ -49,7 +49,9 @@ COPY . /app/
 
 # Asigurare format Unix (LF) și permisiuni de execuție pentru entrypoint (evită erorile Windows CRLF)
 RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && \
-    chmod +x /app/docker-entrypoint.sh
+    chmod 755 /app/docker-entrypoint.sh && \
+    ln -sf /app/docker-entrypoint.sh /docker-entrypoint.sh && \
+    ln -sf /app/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Creare directoare pentru mount-uri locale și asigurare permisiuni de scriere
 RUN mkdir -p /app/input_images /app/output && \
