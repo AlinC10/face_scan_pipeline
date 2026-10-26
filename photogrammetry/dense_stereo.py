@@ -155,14 +155,18 @@ class DenseStereoMatcher:
         )
 
         # 1. Pre-Shift Right Image horizontally by +d0
-        #    I'_R(x, y) = I_R(x + d0, y)
+        #    In standard rectified stereo: x_R = x_L - d.
+        #    With d = d0 + Δd: x_R + d0 = x_L - Δd.
+        #    Therefore, to search for residual Δd in [0, num_disparities],
+        #    the right image feature at x_R must be moved to x'_R = x_R + d0,
+        #    which corresponds to translating the right image to the RIGHT by +d0:
         shifted_right = np.zeros_like(rect_right_2k)
         if 0 < d0_shift < w:
-            shifted_right[:, :w - d0_shift] = rect_right_2k[:, d0_shift:]
+            shifted_right[:, d0_shift:] = rect_right_2k[:, :w - d0_shift]
         elif d0_shift == 0:
             shifted_right = rect_right_2k.copy()
         else:
-            log.warning("d0_shift (%d) exceeds image width (%d); clamping.", d0_shift, w)
+            log.warning("d0_shift (%d) invalid; clamping.", d0_shift)
             d0_shift = 0
             shifted_right = rect_right_2k.copy()
 
@@ -181,18 +185,18 @@ class DenseStereoMatcher:
         valid_residual = (disp_residual > 0.0) & (disp_residual < float(self.num_disparities))
         d_total[valid_residual] = disp_residual[valid_residual] + float(d0_shift)
 
-        # 4. Apply Facial Mask (Zero out all background pixels)
+        # 4. Median Filtering to smooth micro-specularities
+        d_total = cv2.medianBlur(d_total, 3)
+
+        # 5. Apply Facial Mask (Zero out all background pixels)
         if mask_2k is not None:
             facial_zone = mask_2k > 127
             d_total[~facial_zone] = 0.0
             confidence[~facial_zone] = 0.0
             valid_residual = valid_residual & facial_zone
 
-        # 5. Median Filtering to smooth micro-specularities
-        d_total = cv2.medianBlur(d_total, 3)
-
         # 6. Metrics & Statistics
-        valid_pixels = d_total[d_total > float(d0_shift)]
+        valid_pixels = d_total[(d_total > float(d0_shift)) & (d_total < float(d0_shift + self.num_disparities))]
         if len(valid_pixels) > 0:
             min_d = float(np.min(valid_pixels))
             max_d = float(np.max(valid_pixels))

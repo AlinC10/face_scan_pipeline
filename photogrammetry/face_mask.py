@@ -134,16 +134,25 @@ class FacialMaskExtractor:
                 dys.append(abs(y0 - y1))
 
             d_median = float(np.median(dxs))
+            d_p5 = float(np.percentile(dxs, 5))
+            d_p95 = float(np.percentile(dxs, 95))
             rms_y = float(np.sqrt(np.mean(np.array(dys) ** 2)))
-            log.info("Facial Landmarks Disparity: Median d = %.1f px | Epipolar RMS Parallax = %.2f px", d_median, rms_y)
+            log.info(
+                "Facial Landmarks Disparity: Median d = %.1f px (p5=%.1f, p95=%.1f) | Epipolar RMS Parallax = %.2f px",
+                d_median, d_p5, d_p95, rms_y
+            )
+
+            # Robust pre-shift: guarantees that even the furthest facial features
+            # (cheeks/temples with minimum disparity) have non-negative residual disparity Δd >= 0
+            d0_shift = max(0, int(d_p5 - 32.0))
+            # Ensure the closest features (nose tip with max disparity) stay inside the search window
+            if (d_p95 - d0_shift) > (self.residual_window - 24):
+                d0_shift = max(0, int(d_p95 - (self.residual_window - 24)))
         else:
             log.warning("Face detected in Camera 0 but not Camera 1; using nominal rig disparity prior (%.1f px).", self.nominal_disparity)
             d_median = self.nominal_disparity
             rms_y = 0.0
-
-        # Pre-shift formula: d0 = max(0, int(d_median - residual_window / 2))
-        half_win = self.residual_window // 2  # typically 128 - 130 px
-        d0_shift = max(0, int(d_median - half_win))
+            d0_shift = max(0, int(d_median - self.residual_window // 2))
 
         log.info("Initialized CREStereo Pre-Shift: d0 = %d px (Residual Search Window: [0, %d] px)", d0_shift, self.residual_window)
 

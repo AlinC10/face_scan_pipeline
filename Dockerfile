@@ -47,16 +47,19 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Copiere cod sursă și active (conform regulilor din .dockerignore)
 COPY . /app/
 
+# Asigurare format Unix (LF) și permisiuni de execuție pentru entrypoint (evită erorile Windows CRLF)
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && \
+    chmod +x /app/docker-entrypoint.sh
+
 # Creare directoare pentru mount-uri locale și asigurare permisiuni de scriere
 RUN mkdir -p /app/input_images /app/output && \
-    chmod 777 /app/output /app/input_images && \
-    chmod +x /app/docker-entrypoint.sh
+    chmod 777 /app/output /app/input_images
 
 # Declarare volume pentru persistență date
 VOLUME ["/app/input_images", "/app/output"]
 
-# Punct de intrare inteligent
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+# Punct de intrare inteligent (invocat direct prin /bin/bash pentru protecție la execuție)
+ENTRYPOINT ["/bin/bash", "/app/docker-entrypoint.sh"]
 
 # Comandă implicită: procesează perechile stereo din input_images/rig și exportă în output/
 CMD []

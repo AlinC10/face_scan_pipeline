@@ -428,6 +428,7 @@ def run_photogrammetry_pipeline(
         focal_px_2k=rect_res.effective_focal_2k,
         centroid_mm=poisson_res.centroid_mm,
         output_dir=out_dir,
+        baseline_mm=rect_res.baseline_mm,
     )
 
     summary_report["artifacts"].update({k: str(v) for k, v in baking_res.saved_paths.items()})

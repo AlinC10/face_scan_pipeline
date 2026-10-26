@@ -49,9 +49,11 @@ class TextureBaker:
         focal_px_2k: float,
         centroid_mm: Tuple[float, float, float],
         output_dir: Union[str, Path],
+        baseline_mm: float = 163.4,
     ) -> TextureBakingResult:
         """
-        Bakes complete albedo textures and tangent-space normal maps for both High and Low meshes.
+        Bakes complete albedo textures and tangent-space normal maps for both High and Low meshes
+        using bilateral dual-camera stereo fusion across the 27° convergence field.
         """
         t_start = time.time()
         out_d = Path(output_dir).resolve()
@@ -66,16 +68,16 @@ class TextureBaker:
 
         log.info("Starting Texture Baking (Resolution: %dx%d)...", self.texture_size, self.texture_size)
 
-        # 1. Projective Color Sampling for Low-Poly Mesh Vertices
+        # 1. Dual-Camera Projective Color Sampling for Low-Poly Mesh Vertices
         low_verts = low_mesh.vertices
-        v_colors_low = self._project_vertices_to_colors(
-            low_verts, rect_left_2k, focal_px_2k, cx, cy, x_med, y_med, z_med
+        v_colors_low = self._project_stereo_vertices_to_colors(
+            low_verts, rect_left_2k, rect_right_2k, focal_px_2k, baseline_mm, cx, cy, x_med, y_med, z_med
         )
 
-        # 2. Projective Color Sampling for High-Poly Mesh Vertices
+        # 2. Dual-Camera Projective Color Sampling for High-Poly Mesh Vertices
         high_verts = high_mesh.vertices
-        v_colors_high = self._project_vertices_to_colors(
-            high_verts, rect_left_2k, focal_px_2k, cx, cy, x_med, y_med, z_med
+        v_colors_high = self._project_stereo_vertices_to_colors(
+            high_verts, rect_left_2k, rect_right_2k, focal_px_2k, baseline_mm, cx, cy, x_med, y_med, z_med
         )
 
         # 3. Rasterize Low-Poly Albedo Texture onto UV Atlas
@@ -165,6 +167,73 @@ class TextureBaker:
             saved_paths=saved,
         )
 
+    def _project_stereo_vertices_to_colors(
+        self,
+        vertices: np.ndarray,
+        rect_left_2k: np.ndarray,
+        rect_right_2k: np.ndarray,
+        focal_px: float,
+        baseline_mm: float,
+        cx: float,
+        cy: float,
+        x_med: float,
+        y_med: float,
+        z_med: float,
+        blend_width_mm: float = 24.0,
+    ) -> np.ndarray:
+        """
+        Projects 3D mesh vertices into both rectified stereo views and blends colors
+        smoothly across the facial midline, providing complete bilateral texture coverage.
+        """
+        h_l, w_l = rect_left_2k.shape[:2]
+        h_r, w_r = rect_right_2k.shape[:2]
+
+        X = vertices[:, 0]
+        Y = vertices[:, 1]
+        Z = vertices[:, 2]
+
+        # Recover metric distance from camera: z_mm = z_med - Z
+        Z_mm = np.maximum(10.0, z_med - Z)
+
+        # 1. Left Camera (Cam 0) Projection: optical center at (0, 0)
+        px_l = ((X + x_med) * focal_px / Z_mm) + cx
+        py_l = -((Y + y_med) * focal_px / Z_mm) + cy
+
+        # 2. Right Camera (Cam 1) Projection: optical center at (+B, 0)
+        #    In rectified Bouguet coordinates: px_r = px_l - (baseline * focal / Z_mm)
+        disp_px = (baseline_mm * focal_px) / Z_mm
+        px_r = px_l - disp_px
+        py_r = py_l
+
+        # Bound checks
+        valid_l = (px_l >= 0) & (px_l < w_l) & (py_l >= 0) & (py_l < h_l)
+        valid_r = (px_r >= 0) & (px_r < w_r) & (py_r >= 0) & (py_r < h_r)
+
+        px_l_clip = np.clip(np.round(px_l).astype(np.int32), 0, w_l - 1)
+        py_l_clip = np.clip(np.round(py_l).astype(np.int32), 0, h_l - 1)
+        px_r_clip = np.clip(np.round(px_r).astype(np.int32), 0, w_r - 1)
+        py_r_clip = np.clip(np.round(py_r).astype(np.int32), 0, h_r - 1)
+
+        colors_l = rect_left_2k[py_l_clip, px_l_clip].astype(np.float32)
+        colors_r = rect_right_2k[py_r_clip, px_r_clip].astype(np.float32)
+
+        # 3. Horizontal bilateral alpha weighting across facial midline:
+        #    X < 0 is subject's right cheek (facing left / Cam 0) -> alpha -> 1.0 (100% Left)
+        #    X > 0 is subject's left cheek (facing right / Cam 1) -> alpha -> 0.0 (100% Right)
+        half_w = blend_width_mm / 2.0
+        alpha = np.clip((half_w - X) / blend_width_mm, 0.0, 1.0)
+
+        # Enforce single-camera fallback when one view is clipped at image border
+        alpha[valid_l & ~valid_r] = 1.0
+        alpha[~valid_l & valid_r] = 0.0
+
+        v_colors = alpha[:, None] * colors_l + (1.0 - alpha[:, None]) * colors_r
+        # Default neutral grey for vertices outside both camera views
+        both_invalid = ~valid_l & ~valid_r
+        v_colors[both_invalid] = 128.0
+
+        return np.clip(np.round(v_colors), 0, 255).astype(np.uint8)
+
     def _project_vertices_to_colors(
         self,
         vertices: np.ndarray,
@@ -177,17 +246,15 @@ class TextureBaker:
         z_med: float,
     ) -> np.ndarray:
         """
-        Projects 3D mesh vertices into the rectified image frame and samples BGR colors.
+        Projects 3D mesh vertices into a single rectified image frame (monocular fallback).
         """
         h, w = rect_img_bgr.shape[:2]
         n_verts = len(vertices)
-        v_colors = np.full((n_verts, 3), 128, dtype=np.uint8)
 
         X = vertices[:, 0]
         Y = vertices[:, 1]
         Z = vertices[:, 2]
 
-        # Recover metric distance from camera: z_mm = z_med - Z
         Z_mm = np.maximum(10.0, z_med - Z)
 
         px = ((X + x_med) * focal_px / Z_mm) + cx
