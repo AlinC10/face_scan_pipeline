@@ -6,6 +6,11 @@ RunPod Dense Stereo Photogrammetry CLI (Etapele 1, 2, 3)
 Orchestrates the photogrammetry pipeline for high-fidelity 3D facial reconstruction
 from dual Arducam IMX477 camera rigs (27° convergence, 15° pitch, 35 cm distance).
 
+Default mode (--mode dense): after Etapa 1 the pair goes to photogrammetry/face_pipeline.py
+(measured rig calibration, MediaPipe-guided dense matching with pose refinement, two-view
+disparity, height-field fusion, two-view texture baking and the 8 standard deliverables).
+The stages below describe the classical modes (--mode poisson / hybrid).
+
 Etapa 1:
   1. Discovery & ingestion of 12.3MP (4056x3040) stereo pairs from rig/0 and rig/1.
   2. Extraction of carriage metric height Z_rig from filename convention (f_<height>.jpg).
@@ -121,7 +126,8 @@ def run_photogrammetry_pipeline(
     stop_after_stage: int = 7,
     rectify_native: bool = False,
     refine_with_features: bool = True,
-    reconstruction_mode: str = "hybrid",
+    reconstruction_mode: str = "dense",
+    calibration_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """
     Executes the multi-stage photogrammetry pipeline.
@@ -196,6 +202,28 @@ def run_photogrammetry_pipeline(
 
     if stop_after_stage == 1:
         log.info("Pipeline terminated after Etapa 1 as requested.")
+        return summary_report
+
+    # =========================================================================
+    # MOD DENSE (implicit): calibrare rig + potriviri dense ghidate MediaPipe,
+    # disparitate din ambele vederi, fuziune metrică, textură din pozele 12.3MP
+    # =========================================================================
+    if reconstruction_mode == "dense":
+        from photogrammetry.face_pipeline import FacePipelineConfig, reconstruct_face_pair
+
+        log.info("=" * 70)
+        log.info("ETAPA 2-7: RECONSTRUCȚIE DENSĂ DIN DOUĂ VEDERI (CALIBRARE RIG + MEDIAPIPE + DIS)")
+        log.info("=" * 70)
+        face_res = reconstruct_face_pair(
+            ingestion_res.cam0_meta.path,
+            ingestion_res.cam1_meta.path,
+            out_dir,
+            FacePipelineConfig(calibration_path=calibration_path, name=name),
+        )
+        summary_report["stages_completed"].append("stage_2_7_dense_two_view_face")
+        summary_report["artifacts"].update({k: str(v) for k, v in face_res.deliverables.items()})
+        summary_report["status"] = "success"
+        summary_report["manifest"] = str(face_res.manifest_path)
         return summary_report
 
     # =========================================================================
@@ -655,6 +683,9 @@ Examples:
 
   3. Run only Etapa 1 & 2:
      python run_photogrammetry_runpod.py --rig-dir input_images/rig --stop-after-stage 2 -o output/
+
+  4. Dense face reconstruction with another rig calibration (e.g. straight from Turntable Studio):
+     python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib path/to/turntable_calib.json -o output/
         """
     )
     parser.add_argument(
@@ -711,9 +742,16 @@ Examples:
     parser.add_argument(
         "--mode",
         dest="reconstruction_mode",
-        default="hybrid",
-        choices=["hybrid", "poisson"],
-        help="Reconstruction algorithm: 'hybrid' (MediaPipe prior + dense Laplacian fitting, recommended) or 'poisson' (classical unconstrained)",
+        default="dense",
+        choices=["dense", "hybrid", "poisson"],
+        help="Reconstruction algorithm: 'dense' (calibrated rig + MediaPipe-guided dense two-view stereo, "
+             "recommended), 'hybrid' (MediaPipe prior + Laplacian fitting) or 'poisson' (classical SGBM + Poisson)",
+    )
+    parser.add_argument(
+        "--calib",
+        default=None,
+        help="Stereo rig calibration for --mode dense: assets/rig_calibration.json (default) "
+             "or a turntable_calib.json from turntable_poses.py",
     )
     parser.add_argument(
         "--rectify-native",
@@ -736,6 +774,7 @@ Examples:
             stop_after_stage=args.stop_after_stage,
             rectify_native=args.rectify_native,
             reconstruction_mode=args.reconstruction_mode,
+            calibration_path=args.calib,
         )
     except Exception as e:
         log.error("Pipeline failure: %s", e, exc_info=True)

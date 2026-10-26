@@ -107,7 +107,8 @@ def test_stage6_7_end_to_end_on_real_sample():
         )
 
         assert summary["status"] == "success"
-        assert len(summary["stages_completed"]) == 7
+        # Default mode is the dense two-view face reconstruction (ingestion + stages 2-7 in one step).
+        assert summary["stages_completed"] == ["stage_1_ingestion", "stage_2_7_dense_two_view_face"]
 
         out_path = Path(td)
         assert (out_path / "obj" / "high" / "high_model.obj").is_file()

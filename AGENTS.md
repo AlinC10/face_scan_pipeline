@@ -124,7 +124,15 @@ Toate scripturile de reconstrucție 3D folosesc mediul virtual local `.venv`.
 
 # 3. Rulare pipeline fotogrametrie densă (CREStereo / Poisson):
 python run_photogrammetry_windows.py --rig-dir input_images/rig -o output/
+
+# 4. Reconstrucție facială densă din două vederi (implicit în Docker; calibrare din assets/rig_calibration.json):
+python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/
 ```
+
+> [!NOTE]
+> Geometria măsurată a rig-ului (calibrare AprilTag din Turntable Studio, `assets/rig_calibration.json`):
+> baza $B = 164.3$ mm și rotația relativă între camere $19.7^\circ$ (nu $27^\circ$ cât presupun valorile nominale).
+> Pipeline-ul dens rafinează pe fiecare captură rotația relativă (corecții tipice < 1°), păstrând lungimea bazei.
 
 > [!NOTE]
 > Captura mecatronică și comanda fizică a motoarelor pe Raspberry Pi 5 se declanșează nativ din daemonul scanerului ([`PLAN_FACE_SCAN.md`](/home/alin/Desktop/3d-scanner-raspberry-pi/PLAN_FACE_SCAN.md)) prin endpoint-ul `POST /scanner/face/capture`.

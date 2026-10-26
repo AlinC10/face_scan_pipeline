@@ -52,6 +52,7 @@ Arhitectura proiectului este decuplată modular între **achiziția hardware mec
 | Obiectivul Tău | Scriptul Executabil | Modul Python | Ce Produce în `output/` |
 | :--- | :--- | :--- | :--- |
 | **Reconstrucție facială completă din folderul rig-ului sau pereche stereo** | `./run_reconstruct.sh` | [`reconstruct_3d.py`](reconstruct_3d.py) | Pachetul complet de 8 livrabile standard (`high_model.*` și `low_model.*` în `obj`, `glb`, `stl`, `3mf`) |
+| **Reconstrucție facială densă metrică din perechea stereo (implicit în Docker)** | `python run_photogrammetry_runpod.py` | [`photogrammetry/face_pipeline.py`](photogrammetry/face_pipeline.py) | Cele 8 livrabile standard (high ~150k fețe, low 20k fețe, texturi 4096/2048) + manifest |
 | **Fotogrametrie densă pe Windows cu GPU NVIDIA (CREStereo + Poisson)** | `python run_photogrammetry_windows.py` | [`run_photogrammetry_windows.py`](run_photogrammetry_windows.py) | Master Mesh Poisson dens, hartă disparitate, decimare 15k triunghiuri |
 | **Extragere repere 3D metrice & animație facială (52 ARKit blendshapes)** | `./run_scanner.sh` | [`face_scanner.py`](face_scanner.py) | Fișier JSON cu 478 repere metrice, orientare 4x4, blendshapes și imagine adnotată |
 
@@ -90,18 +91,42 @@ Scriptul [`reconstruct_3d.py`](reconstruct_3d.py) (apelat prin `./run_reconstruc
 
 ---
 
-### Pipeline 2: Fotogrametrie Stereo Densă pe Windows / GPU (CREStereo & Poisson)
+### Pipeline 2: Reconstrucție Facială Densă din Două Vederi (`--mode dense`, implicit)
 
-Scriptul [`run_photogrammetry_windows.py`](run_photogrammetry_windows.py) rulează pipeline-ul de fotogrametrie densă pe Windows cu placă video NVIDIA sau Linux CUDA:
+Scriptul [`run_photogrammetry_runpod.py`](run_photogrammetry_runpod.py) (și containerul Docker) rulează implicit
+pipeline-ul dens din [`photogrammetry/face_pipeline.py`](photogrammetry/face_pipeline.py). Rulează pe CPU
+(~2.5 min pentru o pereche 12.3 MP) și nu are nevoie de GPU.
 
-```powershell
-# Rulare pe PC cu Windows:
-python run_photogrammetry_windows.py --rig-dir input_images/rig -o output/
+```bash
+python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/
+# cu altă calibrare (ex. direct din Turntable Studio):
+python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib cale/turntable_calib.json -o output/
 ```
 
-* Extrage priorul metric $Z_{\text{rig}}$ direct din numele fișierului `f_{Z}.jpg`.
-* Estimează matricea fundamentală prin inlieri RANSAC MediaPipe (fără tablă de șah).
-* Generează Master High-Poly prin **Screened Poisson Surface Reconstruction** cu Open3D și decimează la 15k fețe prin Quadric Error Metrics (QEM).
+1. **Calibrarea rig-ului** ([`photogrammetry/rig_calibration.py`](photogrammetry/rig_calibration.py)):
+   [`assets/rig_calibration.json`](assets/rig_calibration.json) conține intrinsecii și poziția relativă a camerelor,
+   măsurate cu `turntable_poses.py` pe discul AprilTag ($B = 164.3$ mm, rotație relativă $19.7^\circ$,
+   $f \approx 2550$ px, distorsiune radială). Se acceptă și un `turntable_calib.json` nemodificat.
+2. **Potriviri dense ghidate de MediaPipe** ([`photogrammetry/face_correspondence.py`](photogrammetry/face_correspondence.py)):
+   reperele MediaPipe au erori de 10–20 px între vederi la 12.3 MP, deci servesc doar ca inițializare. Imaginea
+   camerei 1 este deformată pe camera 0 prin teselarea feței, apoi fluxul optic DIS măsoară reziduul sub-pixel
+   (verificare înainte-înapoi). Pe aceste ~14k corespondențe se rafinează rotația și direcția bazei
+   (lungimea bazei rămâne cea calibrată, deci scara e metrică): eroarea epipolară scade de la ~10 px la ~0.8 px.
+3. **Disparitate din ambele vederi**: rectificare Bouguet la 2028×1520, DIS ghidat de un prior de formă (fața 3D
+   MediaPipe a fiecărei vederi, adusă la adâncime metrică prin $Z = c_0 + c_1 z_{mp} + c_2 x + c_3 y$ estimat robust
+   pe măsurători), cu rame de ochelari mascate (black-hat) și verificări înainte-înapoi / verticale.
+4. **Fuziune** ([`photogrammetry/face_surface.py`](photogrammetry/face_surface.py)): punctele ambelor vederi, ponderate
+   cu unghiul de vizare, devin un câmp de înălțimi în sistemul capului (aliniere Umeyama cu fața canonică) la 0.5 mm;
+   corecția robustă a priorului + detaliul măsurat; în spatele lentilelor doar corecția netedă.
+5. **Mesh-uri**: high = grila de 0.5 mm (~150k fețe), low = decimare QEM la 20k fețe; atlase UV xatlas.
+6. **Textură** ([`photogrammetry/face_texture.py`](photogrammetry/face_texture.py)): din pozele originale 12.3 MP,
+   cu vizibilitate (z-buffer per cameră), ponderi $\cos^3\theta$, echilibrare de culoare între camere și amestec pe
+   două benzi (frecvențe joase mediate, detaliul din camera cea mai frontală); hartă de normale tangent-space
+   a mesh-ului high coaptă pe atlasul low.
+7. **Livrabile**: OBJ/GLB în metri, STL/3MF în mm ca solid închis (fața + placă spate), plus
+   `photogrammetry_manifest.json` și imagini de control în `output/debug/`.
+
+Modurile vechi rămân disponibile: `--mode poisson` (SGBM + Poisson) și `--mode hybrid`.
 
 ---
 
