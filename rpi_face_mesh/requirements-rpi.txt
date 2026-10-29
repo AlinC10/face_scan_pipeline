@@ -1,0 +1,10 @@
+# MediaPipe face-mesh mode on the Raspberry Pi (Python 3.9-3.12, aarch64).
+# The scanner venv already has mediapipe, numpy, opencv-python, pillow, networkx.
+mediapipe>=0.10.14
+opencv-python
+numpy<2.0
+pillow
+trimesh>=4.0.0     # OBJ / GLB / STL / 3MF export
+lxml               # 3MF export (trimesh)
+networkx           # trimesh
+DracoPy            # optional: Draco-compressed GLB (without it the GLB is written uncompressed)

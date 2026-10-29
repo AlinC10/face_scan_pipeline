@@ -1,0 +1,84 @@
+{
+  "description": "Stereo calibration of the dual IMX477 rig (camera 0 = rig/0, camera 1 = rig/1). Convention: X_cam1 = R_1_0 * X_cam0 + T_1_0_mm. Distortion in OpenCV order [k1, k2, p1, p2, k3].",
+  "source": "turntable_studio turntable_poses.py (AprilTag disc, 40 images, 1562 corners, RMS 2.48 px)",
+  "tag_scale": 1.0,
+  "tag_scale_note": "print scale of the tag disc used for this calibration (nominal layout); the pipeline rescales the baseline to --tag-scale",
+  "image_size": [
+    4056,
+    3040
+  ],
+  "cam0": {
+    "K": [
+      [
+        2547.203497719371,
+        0,
+        2028.0
+      ],
+      [
+        0,
+        2547.203497719371,
+        1520.0
+      ],
+      [
+        0,
+        0,
+        1.0
+      ]
+    ],
+    "dist": [
+      -0.03444816844687779,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "cam1": {
+    "K": [
+      [
+        2552.4415838483274,
+        0,
+        2028.0
+      ],
+      [
+        0,
+        2552.4415838483274,
+        1520.0
+      ],
+      [
+        0,
+        0,
+        1.0
+      ]
+    ],
+    "dist": [
+      0.027184267193408992,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "R_1_0": [
+    [
+      0.9417697779542226,
+      -0.087670376105803,
+      0.3246283882927083
+    ],
+    [
+      0.09302114068341727,
+      0.9956636631204039,
+      -0.0009681568130129682
+    ],
+    [
+      -0.32313581156846505,
+      0.031109083804022875,
+      0.9458411453234975
+    ]
+  ],
+  "T_1_0_mm": [
+    -160.95853381371052,
+    -7.214095916695272,
+    32.121196023339294
+  ]
+}
