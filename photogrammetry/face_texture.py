@@ -234,6 +234,7 @@ def bake_albedo(
     visibility_mesh: Optional[trimesh.Trimesh] = None,
     gain_sigma_mm: Optional[float] = 15.0,
     weak_weight: float = 0.05,
+    fill_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     debug_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
@@ -247,6 +248,8 @@ def bake_albedo(
       The visibility tolerance grows with the local depth slope of the buffer (grazing surfaces).
     * Unseen or grazing texels (total weight < `weak_weight`): harmonic (Laplace) fill of the low band over
       the mesh surface from the well-seen texels around them, blended in as the weight drops: no edges.
+      `fill_prior` = (per-vertex weight of `mesh`, BGR colour): where that weight is high the unseen texels take
+      this colour instead (the hair colour on the unseen scalp, plan P3.3).
     """
     covered, f, b, pos, nrm = _texel_geometry(mesh, size)
     n_tex = len(pos)
@@ -321,6 +324,10 @@ def bake_albedo(
     rows, cols = np.nonzero(covered)
     if weak.any() and strong.any():
         fill = mesh_harmonic_fill(mesh, f, b, low, strong)[weak]
+        if fill_prior is not None:
+            vw, bgr = fill_prior
+            tw = np.clip(np.sum(b[weak] * np.asarray(vw)[mesh.faces[f[weak]]], axis=1), 0.0, 1.0)[:, None]
+            fill = (1.0 - tw) * fill + tw * np.asarray(bgr, dtype=np.float64)[None, :]
         alpha = np.clip(wsum[weak] / weak_weight, 0.0, 1.0)[:, None] ** 2
         colour[weak] = alpha * colour[weak] + (1.0 - alpha) * fill
 

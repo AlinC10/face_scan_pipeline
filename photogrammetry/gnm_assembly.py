@@ -37,6 +37,7 @@ MAX_DISPLACEMENT_MM = 6.0
 NEAR_FULL_MM = 4.0                 # vertices within this distance of the measured surface take the full detail
 NEAR_ZERO_MM = 8.0                 # ... and none beyond this one
 NECK_CUT_BELOW_CHIN_MM = 35.0
+HAIR_THICKNESS_MM = 5.0            # hair cap (P3.3): the bald GNM scalp raised by this much where nothing is measured
 GLB_EXPRESSIONS = ("HAPPY", "SMILE_WIDE", "SURPRISE", "WINK_LEFT", "WINK_RIGHT", "SQUINT", "PUCKER", "DISGUST",
                    "CORNERS_DOWN", "BLOW", "MOUTH_LEFT", "MOUTH_RIGHT")
 PART_COLOURS = {"eyes": (0.92, 0.91, 0.88, 1.0), "teeth": (0.93, 0.9, 0.82, 1.0), "tongue": (0.78, 0.42, 0.42, 1.0)}
@@ -52,6 +53,7 @@ class HeadAssembly:
     skin_vertex_ids: np.ndarray                    # GNM vertex id of every low vertex
     expression: str
     stats: Dict[str, float] = field(default_factory=dict)
+    hair_low: Optional[np.ndarray] = None          # hair-cap weight (0-1) of every low vertex
 
 
 def fit_gnm(surface, fitter: Optional[GNMFitter] = None) -> Tuple[GNMFitter, GNMFitResult]:
@@ -119,8 +121,36 @@ def _subdivide(V: np.ndarray, F: np.ndarray, times: int = 2):
     return V, F
 
 
+def _laplacian_smooth(values: np.ndarray, F: np.ndarray, iterations: int) -> np.ndarray:
+    from scipy.sparse import coo_matrix
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    n = len(values)
+    A = coo_matrix((np.ones(2 * len(e)), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])), shape=(n, n)).tocsr()
+    deg = np.asarray(A.sum(axis=1)).ravel() + 1.0
+    v = values.astype(np.float64)
+    for _ in range(iterations):
+        v = (v + A @ v) / deg
+    return v
+
+
+def hair_region(g, identity: np.ndarray, used: np.ndarray, F_low: np.ndarray) -> np.ndarray:
+    """
+    Scalp weight (0-1) of the skin vertices `used`, from the GNM regions in the model frame (y up, z forward):
+    the exterior skin outside the face mask and the ears, above the top of the ears, or behind them down to
+    the ear lobes (the nape); smoothed over the mesh so the cap has no step at its border.
+    """
+    Vm = g.bind_vertices(identity, np.zeros(g.expression_dim))[used] * 1000.0
+    ears = g.group("ears")[used]
+    ear_top, ear_bottom = Vm[ears, 1].max(), Vm[ears, 1].min()
+    ear_z = Vm[ears, 2].mean()
+    base = g.group("skin_exterior")[used] & ~g.group("hockey_mask", "ears", "eyes", "eye_sockets")[used]
+    scalp = base & ((Vm[:, 1] > ear_top) | ((Vm[:, 2] < ear_z) & (Vm[:, 1] > ear_bottom)))
+    w = _laplacian_smooth(scalp.astype(np.float64), F_low, 12)
+    return np.clip((w - 0.2) / 0.6, 0.0, 1.0)
+
+
 def assemble_head(surface, fitter: GNMFitter, fit: GNMFitResult, expression: str = "capture",
-                  high_max_faces: int = 200_000, decimate=None) -> HeadAssembly:
+                  high_max_faces: int = 200_000, decimate=None, hair_thickness_mm: float = HAIR_THICKNESS_MM) -> HeadAssembly:
     g = fitter.g
     skin_tri = g.triangles[g.skin_triangles]
     used = np.unique(skin_tri)
@@ -141,14 +171,18 @@ def assemble_head(surface, fitter: GNMFitter, fit: GNMFitResult, expression: str
     N_cap = _vertex_normals(V_cap[used], F_low)
     d_low, w_low = normal_displacement(surface, V_cap[used], N_cap, ramp, F_low, smooth_iterations=1)
     N_out = _vertex_normals(V_out[used], F_low)
-    V_low = V_out[used] + d_low[:, None] * N_out
+    # Hair cap: raised where the scalp is not measured (the stereo already holds the hair it sees)
+    hair = hair_region(g, fit.params.identity, used, F_low) if hair_thickness_mm > 0 else np.zeros(len(used))
+    hair_low = hair * (1.0 - np.clip(w_low, 0.0, 1.0))
+    V_low = V_out[used] + (d_low + hair_thickness_mm * hair_low)[:, None] * N_out
     low = trimesh.Trimesh(V_low, F_low, process=False)
 
     # High: subdivided twice, detail from the height field (computed on the captured expression)
     S_cap, F_high = _subdivide(V_cap[used], F_low)
     S_out, _ = _subdivide(V_out[used], F_low)
     d_high, w_high = normal_displacement(surface, S_cap, _vertex_normals(S_cap, F_high), ramp, F_high)
-    S_out = S_out + d_high[:, None] * _vertex_normals(S_out, F_high)
+    hair_high = _subdivide(np.c_[hair, np.zeros((len(hair), 2))], F_low)[0][:, 0] * (1.0 - np.clip(w_high, 0.0, 1.0))
+    S_out = S_out + (d_high + hair_thickness_mm * hair_high)[:, None] * _vertex_normals(S_out, F_high)
     high = trimesh.Trimesh(S_out, F_high, process=True)
     n_sub = len(high.faces)
     if decimate is not None and len(high.faces) > high_max_faces:
@@ -172,10 +206,11 @@ def assemble_head(surface, fitter: GNMFitter, fit: GNMFitResult, expression: str
     stats = {"expression": expression, "low_vertices": int(len(V_low)), "high_faces_subdivided": int(n_sub),
              "high_faces": int(len(high.faces)), "detail_weighted_fraction_high": round(float(np.mean(w_high > 0.5)), 3),
              "displacement_p95_mm": round(float(np.percentile(np.abs(d_high[w_high > 0.5]), 95)), 2)
-             if (w_high > 0.5).any() else 0.0}
+             if (w_high > 0.5).any() else 0.0,
+             "hair_cap_mm": hair_thickness_mm, "hair_cap_fraction_low": round(float(np.mean(hair_low > 0.5)), 3)}
     log.info("GNM head assembled (%s): low %d vertices, high %d -> %d faces, detail on %.0f%% of the high vertices",
              expression, len(V_low), n_sub, len(high.faces), 100 * stats["detail_weighted_fraction_high"])
-    return HeadAssembly(fit, high, low, g.triangle_uvs[g.skin_triangles], parts, used, expression, stats)
+    return HeadAssembly(fit, high, low, g.triangle_uvs[g.skin_triangles], parts, used, expression, stats, hair_low)
 
 
 # ---------------------------------------------------------------------------------------------- solids

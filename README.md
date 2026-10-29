@@ -145,6 +145,8 @@ ochelarilor rămân în textură), `--export-scale` (implicit 100: 1 mm → 0.1 
    se potrivește pe suprafața măsurată + reperele MediaPipe (RMS ~1 mm). high = GNM subdivizat cu detaliul stereo
    pe normală (~200k fețe), low = topologia GNM (~25k fețe) cu UV-ul lui. Dacă fit-ul depășește 2 mm RMS se
    revine la fața simplă. `--neutral-expression` păstrează identitatea și scoate expresia din captură.
+   Calotă de păr: scalpul nemăsurat (creștet, ceafă) e ridicat cu 5 mm și primește culoarea mediană a părului din
+   segmentare; zona măsurată stereo rămâne neatinsă.
 6. **Mesh-uri doar față** (`--head-model none`): high = grila de 0.5 mm (~150k fețe), low = decimare QEM la 20k fețe; atlase UV xatlas.
 7. **Textură** ([`photogrammetry/face_texture.py`](photogrammetry/face_texture.py)): din pozele originale 12.3 MP,
    cu vizibilitate (z-buffer per cameră), ponderi $\cos^3\theta$, echilibrare de culoare între camere și amestec pe

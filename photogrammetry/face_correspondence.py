@@ -279,6 +279,7 @@ def estimate_disparity(
     max_vertical_px: float = 1.0,
     mask_thin_occluders: bool = True,
     region_mask: Optional[np.ndarray] = None,
+    prior_depth: Optional[np.ndarray] = None,
 ) -> DisparityEstimate:
     """
     Prior-guided disparity from the `reference` view.
@@ -298,6 +299,10 @@ def estimate_disparity(
     `region_mask` (rectified reference view, from the segmentation) replaces the MediaPipe mesh
     outline as the face region: up to the hairline and the lateral cheeks. Outside the mesh the
     initial disparity and the MediaPipe depth are extrapolated with a robust quadratic surface.
+
+    `prior_depth` (h, w) metric depth Z (mm) of a better shape prior rendered in the reference view, NaN where
+    it does not cover (plan P3.1: the fitted GNM head). It replaces the MediaPipe relative depth z_mp in the
+    prior fit (c1 ≈ 1) and starts the passes from its disparity, so the first pass is already close.
     """
     tris = tessellation_triangles()
     ref_img, other_img = (rect.left, rect.right) if reference == "left" else (rect.right, rect.left)
@@ -333,6 +338,17 @@ def estimate_disparity(
         zmp = _extrapolate_quadratic(raster[..., 1], covered, zmp, sup, far)
     zmp = np.where(covered, raster[..., 1], zmp)
     zmp, _ = fill_by_normalized_convolution(zmp, face_mask, sigma=4.0)
+    if prior_depth is not None:
+        known = np.isfinite(prior_depth) & (prior_depth > 50.0)
+        if known[face_mask].mean() > 0.5:
+            zp, _ = fill_by_normalized_convolution(np.nan_to_num(prior_depth), known, sigma=6.0)
+            zp = np.where(known, prior_depth, zp)
+            ok = face_mask & (zp > 50.0)
+            init = np.where(ok, c12 + fB / np.maximum(zp, 50.0), init).astype(np.float32)
+            zmp = np.where(ok, zp, zmp)
+        else:
+            log.warning("Disparity (%s reference): the external prior covers only %.0f%% of the face, not used",
+                        reference, 100.0 * known[face_mask].mean())
 
     occluders = thin_occluder_mask(g_ref, face_mask) if mask_thin_occluders else np.zeros((h, w), bool)
     mx, my = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))

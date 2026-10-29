@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 from photogrammetry.face_texture import rasterize_mesh  # noqa: E402
 
 VIEWS = {"front": (0.0, 0.0), "left 35": (35.0, 0.0), "right 35": (-35.0, 0.0), "below": (0.0, -40.0)}
+BACK_VIEWS = {"left 110": (110.0, 0.0), "back": (180.0, 0.0), "right 110": (-110.0, 0.0), "above": (0.0, 60.0)}
 
 
 def load_textured(path: Path):
@@ -65,12 +66,13 @@ def main(argv=None) -> int:
     ap.add_argument("objs", nargs="+")
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--size", type=int, default=600)
+    ap.add_argument("--back", action="store_true", help="whole-head views: sides, back, above")
     args = ap.parse_args(argv)
     rows = []
     for obj in args.objs:
         mesh, uv, tex = load_textured(Path(obj))
         tiles = []
-        for name, (yaw, pitch) in VIEWS.items():
+        for name, (yaw, pitch) in (BACK_VIEWS if args.back else VIEWS).items():
             img = render(mesh, uv, tex, yaw, pitch, args.size)
             cv2.putText(img, f"{name}  {Path(obj).parent.parent.parent.name}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 255), 1, cv2.LINE_AA)

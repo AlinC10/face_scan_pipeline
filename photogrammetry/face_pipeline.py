@@ -42,6 +42,7 @@ from photogrammetry.face_correspondence import (
     detect_landmarks,
     estimate_disparity,
     guided_raw_matches,
+    rasterize_triangles,
     rectify_pair,
 )
 from photogrammetry.face_segmentation import inpaint_frames, segment_faces
@@ -78,6 +79,10 @@ class FacePipelineConfig:
     head_model: str = "gnm"               # "gnm": whole head (GNM Head v3 fitted + the measured detail); "none": face only
     expression: str = "capture"           # with GNM: "capture" (as photographed) or "neutral" (identity kept)
     max_gnm_rms_mm: float = 2.0           # GNM fit worse than this -> face-only deliverables (logged)
+    # With GNM: second disparity pass with the fitted head as shape prior (P3.1). Off: on the test pair the prior
+    # residual drops 1.8 -> 0.55 mm but the valid matches grow by < 1.5 points and the 30-50-coefficient fit
+    # misses the smile, so the mouth gets worse (landmark error 2.6 -> 3.1-4.1 mm) and the run takes 40 s more.
+    gnm_stereo_pass: bool = False
     save_debug: bool = True
     name: str = "model"
     calibration_info: Dict[str, Any] = field(default_factory=dict)   # how the job's calibration was obtained
@@ -183,8 +188,36 @@ def _reconstruct(left_path, right_path, output_dir, cfg: FacePipelineConfig, ste
     surface = fuse_face_surface(rect, estimates, l0, grid_resolution_mm=cfg.grid_resolution_mm,
                                 spectacles=cfg.spectacles, debug_dir=debug_dir)
     head = None
+    pass2 = {"used": False}
+    fitter = None
+    if cfg.head_model == "gnm" and cfg.gnm_stereo_pass:
+        # P3.1: the GNM fitted on the first surface is a better shape prior than the MediaPipe face (metric, with
+        # the nose / chin / cheek shape): the disparity is measured again from it and the surface fused again.
+        try:
+            fitter, fit = fit_gnm(surface)
+        except Exception as e:
+            fitter, fit = None, None
+            log.warning("GNM stereo pass skipped (%s)", e)
+        if fit is not None and fit.stats["surface_rms_mm"] <= cfg.max_gnm_rms_mm:
+            t2 = time.time()
+            priors = _gnm_prior_depths(rect, surface.head_to_rect, fit.vertices, fitter.g, estimates)
+            before = [float(e.valid.sum() / max(e.face_mask.sum(), 1)) for e in estimates]
+            estimates = [
+                estimate_disparity(rect, l0, l1, lm0[:, 2], reference="left", mask_thin_occluders=cfg.spectacles,
+                                   region_mask=regions[0], prior_depth=priors[0]),
+                estimate_disparity(rect, l1, l0, lm1[:, 2], reference="right", mask_thin_occluders=cfg.spectacles,
+                                   region_mask=regions[1], prior_depth=priors[1]),
+            ]
+            surface = fuse_face_surface(rect, estimates, l0, grid_resolution_mm=cfg.grid_resolution_mm,
+                                        spectacles=cfg.spectacles, debug_dir=debug_dir)
+            after = [float(e.valid.sum() / max(e.face_mask.sum(), 1)) for e in estimates]
+            pass2 = {"used": True, "first_fit_rms_mm": fit.stats["surface_rms_mm"],
+                     "valid_fraction_before": [round(v, 3) for v in before],
+                     "valid_fraction_after": [round(v, 3) for v in after], "duration_s": round(time.time() - t2, 2)}
+            log.info("GNM-guided stereo pass: valid %s -> %s of the face in %.1f s",
+                     pass2["valid_fraction_before"], pass2["valid_fraction_after"], pass2["duration_s"])
     if cfg.head_model == "gnm":
-        head = _gnm_head(surface, cfg)
+        head = _gnm_head(surface, cfg, fitter)
     if head is not None:
         high = _clean(head.high)
         low = head.low
@@ -216,9 +249,18 @@ def _reconstruct(left_path, right_path, output_dir, cfg: FacePipelineConfig, ste
         visibility = surface.smooth_mesh
         high_uv = unwrap_uv(high, cfg.high_texture_size)
         low_uv = unwrap_uv(low, cfg.low_texture_size)
+    fill_high = fill_low = None
+    hair_bgr = _hair_colour([img0, img1], segs) if head is not None and head.hair_low is not None else None
+    if hair_bgr is not None:
+        from scipy.spatial import cKDTree
+        _, nn = cKDTree(head.low.vertices).query(high_uv.vertices)
+        fill_high = (head.hair_low[nn], hair_bgr)
+        fill_low = (head.hair_low[low_src], hair_bgr)
+        log.info("Hair cap colour (B, G, R) %s on the unseen scalp", np.round(hair_bgr).astype(int).tolist())
     tex_high, tex_stats = bake_albedo(high_uv, cameras, size=cfg.high_texture_size,
-                                      visibility_mesh=visibility, debug_dir=debug_dir)
-    tex_low, _ = bake_albedo(low_uv, cameras, size=cfg.low_texture_size, visibility_mesh=visibility)
+                                      visibility_mesh=visibility, fill_prior=fill_high, debug_dir=debug_dir)
+    tex_low, _ = bake_albedo(low_uv, cameras, size=cfg.low_texture_size, visibility_mesh=visibility,
+                             fill_prior=fill_low)
     normal_low = bake_normal_map(low_uv, high, size=cfg.low_texture_size)
     normal_high = flat_normal_map(cfg.high_texture_size)
     t = lap("texture_s", t)
@@ -272,6 +314,7 @@ def _reconstruct(left_path, right_path, output_dir, cfg: FacePipelineConfig, ste
         },
         "surface": surface.stats,
         "gnm": ({**head.fit.stats, **head.stats} if head is not None else {"used": False}),
+        "gnm_stereo_pass": pass2,
         "segmentation": {
             "used": segs[0] is not None,
             "face_fraction": [round(sg.face_fraction, 4) if sg else None for sg in segs],
@@ -298,10 +341,10 @@ def _reconstruct(left_path, right_path, output_dir, cfg: FacePipelineConfig, ste
 
 # ---------------------------------------------------------------------------------------------
 
-def _gnm_head(surface, cfg: FacePipelineConfig):
+def _gnm_head(surface, cfg: FacePipelineConfig, fitter=None):
     """GNM fitted to the measured face and the whole head assembled; None (face-only) when the fit is poor."""
     try:
-        fitter, fit = fit_gnm(surface)
+        fitter, fit = fit_gnm(surface, fitter)
     except Exception as e:                       # model missing, too few points ...
         log.warning("GNM head model not used (%s): face-only deliverables.", e)
         return None
@@ -313,6 +356,49 @@ def _gnm_head(surface, cfg: FacePipelineConfig):
     head.fitter = fitter
     head.fit_lm68 = fitter.g.landmarks68(fit.vertices)
     return head
+
+
+def _hair_colour(images, segs) -> Optional[np.ndarray]:
+    """Median BGR of the pixels the segmenter labels hair (both photographs), None without segmentation."""
+    px = [img[sg.hair] for img, sg in zip(images, segs) if sg is not None and sg.hair.sum() > 2000]
+    if not px:
+        return None
+    return np.median(np.concatenate(px).astype(np.float64), axis=0)
+
+
+def _gnm_prior_depths(rect, head_to_rect: np.ndarray, vertices_head: np.ndarray, gnm, first_pass=None,
+                      agree_mm: float = 1.5, disagree_mm: float = 4.0) -> list:
+    """
+    Depth Z (mm) of the fitted GNM skin rendered in both rectified views (z-buffered), NaN off the head.
+    With the first-pass estimates, the GNM is used only where it agrees with their smooth surface (weight 1 below
+    `agree_mm`, 0 above `disagree_mm`): where the low-dimensional fit misses the capture (the smile, the
+    lips) the first-pass surface stays the prior, so the second pass cannot lose shape the first one measured.
+    """
+    V = vertices_head @ head_to_rect[:3, :3].T + head_to_rect[:3, 3]            # rectified-left frame
+    F = gnm.triangles[gnm.skin_triangles]
+    hom = np.c_[V, np.ones(len(V))]
+    h, w = rect.left.shape[:2]
+    out = []
+    for P in (rect.P1, rect.P2):
+        q = hom @ P.T
+        px = q[:, :2] / q[:, 2:3]
+        Fv = F[(V[F, 2] > 50).all(axis=1)]
+        lo, hi = px[Fv].min(axis=1), px[Fv].max(axis=1)
+        Fv = Fv[(hi[:, 0] >= 0) & (lo[:, 0] < w) & (hi[:, 1] >= 0) & (lo[:, 1] < h)]
+        out.append(rasterize_triangles(px, Fv, V[:, 2], (h, w), depth_channel=0)[..., 0])
+    if first_pass is None:
+        return out
+    fB = rect.focal_px * rect.calib.baseline_mm
+    c12 = float(rect.P1[0, 2] - rect.P2[0, 2])
+    for k, est in enumerate(first_pass):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zs = np.where(est.face_mask & (est.smooth - c12 > 1.0), fB / (est.smooth - c12), np.nan)
+        zg = out[k]
+        diff = np.abs(zg - zs)
+        wg = np.clip((disagree_mm - diff) / (disagree_mm - agree_mm), 0.0, 1.0)
+        wg = cv2.GaussianBlur(np.nan_to_num(wg).astype(np.float32), (0, 0), 5.0)
+        out[k] = np.where(np.isfinite(zs), np.where(np.isfinite(zg), wg * zg + (1 - wg) * zs, zs), np.nan)
+    return out
 
 
 def _face_density(surface, mesh: trimesh.Trimesh) -> np.ndarray:

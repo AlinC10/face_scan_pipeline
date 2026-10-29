@@ -61,6 +61,19 @@ class TestGNM(unittest.TestCase):
         self.assertGreater(solid.volume, 0)
         self.assertAlmostEqual(solid.bounds[0, 1], chin_y - 35.0, delta=1.0)
 
+    def test_hair_region_on_scalp_not_face(self):
+        from photogrammetry.gnm_assembly import hair_region
+        g = self.g
+        F = g.triangles[g.skin_triangles]
+        used = np.unique(F)
+        remap = -np.ones(g.n_vertices, int)
+        remap[used] = np.arange(len(used))
+        w = hair_region(g, np.zeros(g.identity_dim), used, remap[F])
+        V = g.template[used] * 1000.0
+        top = V[:, 1] > V[:, 1].max() - 20.0
+        self.assertGreater(w[top].mean(), 0.9)
+        self.assertLess(w[g.group("hockey_mask")[used]].mean(), 0.05)
+
 
 class TestGLTFWriter(unittest.TestCase):
     def test_skin_and_morph_targets(self):
