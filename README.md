@@ -95,18 +95,29 @@ Scriptul [`reconstruct_3d.py`](reconstruct_3d.py) (apelat prin `./run_reconstruc
 
 Scriptul [`run_photogrammetry_runpod.py`](run_photogrammetry_runpod.py) (și containerul Docker) rulează implicit
 pipeline-ul dens din [`photogrammetry/face_pipeline.py`](photogrammetry/face_pipeline.py). Rulează pe CPU
-(~2.5 min pentru o pereche 12.3 MP) și nu are nevoie de GPU.
+(~3 min pentru o pereche 12.3 MP, vârf de RAM 8.9 GB) și nu are nevoie de GPU.
+
+Structura unui job: perechea facială în `rig/0` și `rig/1`, iar opțional pozele discului AprilTag liber în
+`calib/0` și `calib/1` (numite ca la scanarea de obiecte: `f_<nivel><pas:03d>.jpg`, ex. `f_1000.jpg` … `f_1019.jpg`).
+Când `calib/` există lângă `rig/` (sau se dă `--calib-dir`), `turntable_poses.py` rulează pe ea la fiecare job.
 
 ```bash
-python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/
+python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/   # + input_images/calib dacă există
 # cu altă calibrare (ex. direct din Turntable Studio):
 python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib cale/turntable_calib.json -o output/
+# subiect fără ochelari (sprâncenele, genele și pleoapele sunt măsurate ca suprafață):
+python run_photogrammetry_runpod.py --rig-dir input_images/rig --no-spectacles -o output/
 ```
 
-1. **Calibrarea rig-ului** ([`photogrammetry/rig_calibration.py`](photogrammetry/rig_calibration.py)):
-   [`assets/rig_calibration.json`](assets/rig_calibration.json) conține intrinsecii și poziția relativă a camerelor,
-   măsurate cu `turntable_poses.py` pe discul AprilTag ($B = 164.3$ mm, rotație relativă $19.7^\circ$,
-   $f \approx 2550$ px, distorsiune radială). Se acceptă și un `turntable_calib.json` nemodificat.
+1. **Calibrarea rig-ului** ([`photogrammetry/turntable_calibration.py`](photogrammetry/turntable_calibration.py),
+   [`photogrammetry/rig_calibration.py`](photogrammetry/rig_calibration.py)): în perechea facială discul nu se vede
+   (0 tag-uri detectate), deci calibrarea vine din pozele discului liber din `calib/`. Pe ele rulează
+   [`photogrammetry/turntable_poses.py`](photogrammetry/turntable_poses.py), copiat **nemodificat** din Turntable
+   Studio și apelat ca proces separat (doar CPU, ~5 s pentru 2 × 20 poze); rezultatul (`turntable_calib.json`,
+   raport, poziții) ajunge în `output/calibration/`. Poziția relativă a camerelor nu depinde de înălțimea
+   căruciorului, pentru că ambele camere urcă împreună. Fără `calib/` se folosește calibrarea stocată
+   [`assets/rig_calibration.json`](assets/rig_calibration.json) ($B = 164.3$ mm, rotație relativă $19.7^\circ$,
+   $f \approx 2550$ px) sau `--calib cale/turntable_calib.json`; manifestul spune care sursă a fost folosită.
 2. **Potriviri dense ghidate de MediaPipe** ([`photogrammetry/face_correspondence.py`](photogrammetry/face_correspondence.py)):
    reperele MediaPipe au erori de 10–20 px între vederi la 12.3 MP, deci servesc doar ca inițializare. Imaginea
    camerei 1 este deformată pe camera 0 prin teselarea feței, apoi fluxul optic DIS măsoară reziduul sub-pixel
@@ -115,9 +126,11 @@ python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib cale/turn
 3. **Disparitate din ambele vederi**: rectificare Bouguet la 2028×1520, DIS ghidat de un prior de formă (fața 3D
    MediaPipe a fiecărei vederi, adusă la adâncime metrică prin $Z = c_0 + c_1 z_{mp} + c_2 x + c_3 y$ estimat robust
    pe măsurători), cu rame de ochelari mascate (black-hat) și verificări înainte-înapoi / verticale.
+   Cu `--no-spectacles` masca ramelor este oprită, iar sprâncenele, genele și pleoapele sunt măsurate ca suprafață.
 4. **Fuziune** ([`photogrammetry/face_surface.py`](photogrammetry/face_surface.py)): punctele ambelor vederi, ponderate
    cu unghiul de vizare, devin un câmp de înălțimi în sistemul capului (aliniere Umeyama cu fața canonică) la 0.5 mm;
-   corecția robustă a priorului + detaliul măsurat; în spatele lentilelor doar corecția netedă.
+   corecția robustă a priorului + detaliul măsurat; în spatele lentilelor doar corecția netedă
+   (cu `--no-spectacles`: doar în deschiderea ochilor).
 5. **Mesh-uri**: high = grila de 0.5 mm (~150k fețe), low = decimare QEM la 20k fețe; atlase UV xatlas.
 6. **Textură** ([`photogrammetry/face_texture.py`](photogrammetry/face_texture.py)): din pozele originale 12.3 MP,
    cu vizibilitate (z-buffer per cameră), ponderi $\cos^3\theta$, echilibrare de culoare între camere și amestec pe
@@ -127,6 +140,17 @@ python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib cale/turn
    `photogrammetry_manifest.json` și imagini de control în `output/debug/`.
 
 Modurile vechi rămân disponibile: `--mode poisson` (SGBM + Poisson) și `--mode hybrid`.
+
+#### Rulare în cloud (RunPod + Cloudflare R2)
+
+Fluxul din Turntable Studio, adaptat: un pod **doar cu CPU** per scanare, pornit la cerere și oprit imediat ce
+rezultatul e în R2 (detalii în [`cloud/README.md`](cloud/README.md)). Joburile stau sub `face_jobs/<id>/` în bucket.
+
+```bash
+cp .env.example .env                                  # cheile R2 / Cloudflare / RunPod și FACE_SCAN_IMAGE
+python tools/cloud_scan.py --dry_run                  # verificare R2 + cererea de pod, fără cost
+python tools/cloud_scan.py --name alin --no_spectacles   # input_images/ -> results/alin-<job_id>/
+```
 
 ---
 
@@ -177,27 +201,35 @@ output/
 
 ```
 mediapipe_script/
-├── assets/
-│   ├── face_landmarker.task          # Model neuronal Google MediaPipe
-│   └── canonical_face_model.obj      # Topologia canonică MediaPipe 3D
+├── run_photogrammetry_runpod.py      # Intrarea principală: pipeline-ul facial dens (--mode dense) + modurile vechi
+├── runpod_job.py                     # Intrarea din pod-ul RunPod (descarcă jobul din R2, rulează, urcă rezultatul)
+├── photogrammetry/                   # Pipeline-ul facial dens și modulele lui
+│   ├── face_pipeline.py              #   orchestrarea modului dense
+│   ├── face_correspondence.py        #   repere MediaPipe, potriviri ghidate, rectificare, disparitate DIS
+│   ├── face_surface.py / face_texture.py   # fuziune în câmp de înălțimi / textură și hartă de normale
+│   ├── rig_calibration.py            #   calibrarea stereo și rafinarea poziției relative
+│   ├── turntable_calibration.py      #   apelul turntable_poses.py pe pozele cu discul
+│   ├── turntable_poses.py            #   copiat NEMODIFICAT din Turntable Studio
+│   └── ...                           #   modulele modurilor vechi (poisson / hybrid)
+├── cloud/                            # Cloudflare R2 + RunPod (pod CPU), adaptat din Turntable Studio
+├── tools/                            # Doar local (nu intră în imagine): cloud_scan.py, exp_raft_stereo.py
+├── tests/                            # Teste unitare (față densă, calibrare, cloud, etape vechi)
+├── assets/                           # face_landmarker.task, canonical_face_model.obj, rig_calibration.json, layout tag-uri
 ├── converters/                       # Convertoare GLB, STL, 3MF, Draco
-├── reconstruction/                   # Generatoare geometrie 3D (urechi, relief)
-├── deprecated/                       # Arhivă cod mecatronic standalone vechi
-│   ├── mechatronics_capture/         # rig_capture, orchestrator, hardware_bridge
-│   └── docs/                         # Documente de captură vechi
-├── docs/                             # Planuri și ghiduri de dezvoltare
-│   ├── implemented/                  # Planuri și soluții tehnice finalizate
-│   ├── flame/                        # Arhivă cercetare fitting FLAME monocular
-│   ├── GHID_TESTARE_WINDOWS_PHOTOGRAMMETRY.md
-│   ├── PLAN_RUNPOD_PHOTOGRAMMETRY.md
-│   └── STATUS_PLANURI.md
-├── input_images/rig/                 # Imagini de test organizate pe camere (0/ și 1/)
-├── requirements.txt                  # Dependențele complete de producție (CUDA/Open3D)
-├── reconstruct_3d.py                 # Motorul principal de reconstrucție stereo
-├── run_photogrammetry_windows.py     # Pipeline fotogrametrie densă
+├── reconstruction/                   # Reconstructorul canonic (urechi, relief, fuziune hibridă)
+├── reconstruct_3d.py                 # Reconstructorul stereo canonic (Pipeline 1)
 ├── face_scanner.py                   # Extractor 478 repere & ARKit blendshapes
-├── run_reconstruct.sh                # Runner Bash pentru reconstruct_3d.py
-└── run_scanner.sh                    # Runner Bash pentru face_scanner.py
+├── run_photogrammetry_windows.py     # Pipeline vechi CREStereo / Poisson pentru Windows
+├── run_reconstruct.sh, run_scanner.sh
+├── Dockerfile, docker-entrypoint.sh, requirements-runtime.txt (imagine), requirements.txt (local)
+├── docs/
+│   ├── research/                     # Cercetări: stereo neural (RAFT-Stereo / CREStereo), calibrare pe pereche
+│   ├── archive/                      # Rapoarte vechi (ex. diagnosticul modelului plat de 8 mm, rezolvat)
+│   ├── plans/                        # Planuri (doar local, ignorat de git): active + implemented/
+│   ├── SCANNER_ARCHITECTURE.md, STATUS_PLANURI.md, GHID_TESTARE_WINDOWS_PHOTOGRAMMETRY.md
+├── deprecated/                       # Arhivă (doar local): mechatronics_capture/, flame/ (Faza 3), docs/
+├── input_images/rig/0, rig/1         # Perechea facială (+ input_images/calib/0, 1 opțional)
+└── output/                           # Livrabilele (ignorat de git)
 ```
 
 ---
@@ -225,6 +257,8 @@ Poți rula întregul proiect într-un container Docker izolat, montând folderel
 ```bash
 docker build -t 3d-scanner .
 ```
+Imaginea instalează [`requirements-runtime.txt`](requirements-runtime.txt) (fără PyTorch: modul dense rulează pe CPU).
+Cu variabila `JOB_ID` setată (pod RunPod pornit de `cloud/job.py`) containerul rulează `runpod_job.py`.
 
 ### 2. Rulare Simplă (Dense Stereo Photogrammetry - Etapele 1-7)
 Ia fotografiile din folderul tău local `input_images/` și generează cele 8 livrabile standard direct în folderul tău local `output/`:
@@ -236,6 +270,7 @@ docker run --rm \
 ```
 
 ### 3. Rulare cu Accelerare GPU (NVIDIA)
+Doar pentru modurile vechi cu rețea neuronală (necesită PyTorch din `requirements.txt`); modul dense nu folosește GPU-ul.
 Dacă ai placă video NVIDIA și NVIDIA Container Toolkit:
 ```bash
 docker run --rm --gpus all \

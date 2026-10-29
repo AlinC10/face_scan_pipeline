@@ -269,6 +269,7 @@ def estimate_disparity(
     iterations: int = 3,
     max_fb_error: float = 0.75,
     max_vertical_px: float = 1.0,
+    mask_thin_occluders: bool = True,
 ) -> DisparityEstimate:
     """
     Prior-guided disparity from the `reference` view.
@@ -280,6 +281,10 @@ def estimate_disparity(
         Z(x, y) = c0 + c1·z_mp(x, y) + c2·x + c3·y
     by robust least squares on the measured depth. The next pass starts from that prior
     plus a smooth correction of the measurement, so the final residual motion is small.
+
+    `mask_thin_occluders` excludes spectacle frames (black-hat filter). The same filter also
+    removes eyebrows, lash lines and the lip line, so it can be turned off for subjects
+    scanned without glasses.
     """
     tris = tessellation_triangles()
     ref_img, other_img = (rect.left, rect.right) if reference == "left" else (rect.right, rect.left)
@@ -301,7 +306,7 @@ def estimate_disparity(
     zmp = np.where(covered, raster[..., 1], zmp)
     zmp, _ = fill_by_normalized_convolution(zmp, face_mask, sigma=4.0)
 
-    occluders = thin_occluder_mask(g_ref, face_mask)
+    occluders = thin_occluder_mask(g_ref, face_mask) if mask_thin_occluders else np.zeros((h, w), bool)
     mx, my = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
     xn = (mx - w / 2) / w
     yn = (my - h / 2) / h

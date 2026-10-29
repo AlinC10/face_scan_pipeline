@@ -8,9 +8,14 @@ to_delete
 deprecated
 output_**
 docs/extra
-docs/flame
 
-input_images
 output**
+
+input_images/
+main.tex
+docs/plans/
 STAGIU_CURENT.md
-plans
+
+.env
+results/
+docs

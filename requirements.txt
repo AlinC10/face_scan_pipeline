@@ -19,3 +19,8 @@ scipy>=1.10.0
 pillow>=10.0.0
 xatlas>=0.0.9
 piexif>=1.1.3
+
+# 5. Cloud (RunPod + Cloudflare R2) și cheile din .env pe laptop / Pi
+boto3>=1.34.0
+requests>=2.31.0
+python-dotenv>=1.0.0

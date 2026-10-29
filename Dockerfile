@@ -40,9 +40,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Instalare pachete Python (separat pentru a profita de Docker layer caching)
-COPY requirements.txt /app/requirements.txt
+# requirements-runtime.txt: fără PyTorch (modul dense rulează pe CPU), deci imaginea rămâne mică pentru pod-uri
+COPY requirements-runtime.txt /app/requirements-runtime.txt
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements-runtime.txt
 
 # Copiere cod sursă și active (conform regulilor din .dockerignore)
 COPY . /app/
@@ -63,5 +64,6 @@ VOLUME ["/app/input_images", "/app/output"]
 # Punct de intrare inteligent (invocat direct prin /bin/bash pentru protecție la execuție)
 ENTRYPOINT ["/bin/bash", "/app/docker-entrypoint.sh"]
 
-# Comandă implicită: procesează perechile stereo din input_images/rig și exportă în output/
+# Comandă implicită: procesează perechea din input_images/rig (+ calibrare din input_images/calib) și exportă în output/.
+# Cu JOB_ID setat (pod RunPod pornit de cloud/job.py): runpod_job.py descarcă jobul din R2 și încarcă rezultatul.
 CMD []

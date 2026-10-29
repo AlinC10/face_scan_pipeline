@@ -5,6 +5,11 @@ set -e
 # Docker Entrypoint for 3D Facial Scanner & Photogrammetry Pipeline
 # ==============================================================================
 
+# RunPod pod (JOB_ID set by cloud/job.py): download the job from R2, run, upload the result
+if [ -n "$JOB_ID" ]; then
+    exec python3 runpod_job.py
+fi
+
 # Ensure output directory exists and is writable
 mkdir -p /app/output 2>/dev/null || true
 

@@ -14,8 +14,9 @@ facial surface.
      prior as  z = z_prior + S + b·D,  where S is the robust low-frequency
      correction (σ = 6 mm), D the measured detail (σ = 0.6 mm) and b its
      support. Measurements that disagree with S by more than 2 mm (glasses
-     frames, highlights, occlusion borders) are rejected; behind the lenses only S
-     is used, because the lenses refract.
+     frames, highlights, occlusion borders) are rejected. Inside the eye openings
+     (wet, specular cornea) only S is used; with spectacles the excluded region grows
+     to the area seen through the lenses, because the lenses refract.
   4. Mesh: one vertex per grid cell, two triangles per cell.
 """
 
@@ -47,6 +48,7 @@ EYE_CONTOURS = (
     [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466],
 )
 LENS_REGION_SCALE = 1.7        # eye contour enlarged around its centre ~ area seen through a lens
+EYE_REGION_SCALE = 1.0         # without spectacles: only the eye opening itself
 MAX_GRAZING_DEG = 75.0         # measurements seen more obliquely are discarded
 EDGE_TAPER_PX = 25.0           # weight ramp at the border of each view's face region (rectified px)
 DETAIL_SIGMA_MM = 0.9          # spatial scale of the measured detail kept on top of the smooth surface
@@ -145,6 +147,7 @@ def fuse_face_surface(
     lm_left_rect: np.ndarray,
     grid_resolution_mm: float = 0.5,
     margin_mm: float = 4.0,
+    spectacles: bool = True,
     debug_dir: Optional[Path] = None,
 ) -> FaceSurfaceResult:
     """Fuses the disparity estimates of both reference views into a metric facial mesh."""
@@ -209,12 +212,13 @@ def fuse_face_surface(
     z_prior = np.where(np.isfinite(z_prior), z_prior, z_fill)
     z_prior = cv2.GaussianBlur(z_prior.astype(np.float32), (0, 0), 1.0 / res)
 
-    # Regions seen through the spectacle lenses / eyes: only the low-frequency correction is used.
+    # Eye openings (or the regions seen through spectacle lenses): only the low-frequency correction.
+    eye_scale = LENS_REGION_SCALE if spectacles else EYE_REGION_SCALE
     lens = np.zeros((gh, gw), np.uint8)
     for contour in EYE_CONTOURS:
         g = to_grid(lm_head[contour])
         c = g.mean(0)
-        poly = (c + LENS_REGION_SCALE * (g - c)).round().astype(np.int32)
+        poly = (c + eye_scale * (g - c)).round().astype(np.int32)
         cv2.fillPoly(lens, [poly], 1)
     lens = lens.astype(bool)
 
@@ -238,6 +242,7 @@ def fuse_face_surface(
     coverage = float(inl.sum() / max(mask.sum(), 1))
     stats.update({
         "grid_resolution_mm": res,
+        "spectacles": bool(spectacles),
         "measured_points": n_points,
         "measured_coverage": round(float(meas_valid.sum() / max(mask.sum(), 1)), 3),
         "inlier_coverage": round(coverage, 3),

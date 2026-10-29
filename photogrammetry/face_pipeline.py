@@ -63,8 +63,10 @@ class FacePipelineConfig:
     high_texture_size: int = 4096
     low_texture_size: int = 2048
     refine_pose: bool = True
+    spectacles: bool = True               # mask spectacle frames, no measured detail behind the lenses (False: subject without glasses)
     save_debug: bool = True
     name: str = "model"
+    calibration_info: Dict[str, Any] = field(default_factory=dict)   # how the job's calibration was obtained
 
 
 @dataclass
@@ -117,13 +119,14 @@ def reconstruct_face_pair(
     l0 = rect.rectify_points(lm0, 0)
     l1 = rect.rectify_points(lm1, 1)
     estimates = [
-        estimate_disparity(rect, l0, l1, lm0[:, 2], reference="left"),
-        estimate_disparity(rect, l1, l0, lm1[:, 2], reference="right"),
+        estimate_disparity(rect, l0, l1, lm0[:, 2], reference="left", mask_thin_occluders=cfg.spectacles),
+        estimate_disparity(rect, l1, l0, lm1[:, 2], reference="right", mask_thin_occluders=cfg.spectacles),
     ]
     t = lap("dense_disparity_s", t)
 
     # --- Surface
-    surface = fuse_face_surface(rect, estimates, l0, grid_resolution_mm=cfg.grid_resolution_mm, debug_dir=debug_dir)
+    surface = fuse_face_surface(rect, estimates, l0, grid_resolution_mm=cfg.grid_resolution_mm,
+                                spectacles=cfg.spectacles, debug_dir=debug_dir)
     high = _clean(surface.mesh)
     if len(high.faces) > cfg.high_max_faces:
         high = _decimate(high, cfg.high_max_faces)
@@ -153,7 +156,7 @@ def reconstruct_face_pair(
         "pair_id": pair_id,
         "reconstruction_mode": "dense_two_view",
         "inputs": {"left": str(left_path), "right": str(right_path)},
-        "calibration": calib.to_dict(),
+        "calibration": {**calib.to_dict(), "job": cfg.calibration_info},
         "matching": {
             "guided_correspondences": int(len(pts0)),
             "epipolar_error_median_px": round(float(np.median(epi)), 3),

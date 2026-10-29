@@ -114,6 +114,67 @@ except ImportError:
     )
 
 
+def _latest_pair(pairs: list) -> "StereoIngestionResult":
+    """
+    The most recent capture of a rig folder. The pairs are sorted by name as strings
+    (f_150 < f_95), so with several captures the first one is not the latest.
+    """
+    def mtime(res) -> float:
+        return max(Path(res.cam0_meta.path).stat().st_mtime, Path(res.cam1_meta.path).stat().st_mtime)
+
+    latest = max(pairs, key=mtime)
+    if len(pairs) > 1:
+        log.warning("%d stereo pairs in the rig folder (%s); using the most recent one: '%s'. "
+                    "Use -l / -r to choose another.", len(pairs), ", ".join(r.pair_id for r in pairs), latest.pair_id)
+    return latest
+
+
+def _job_rig_calibration(
+    rig_dir: str | Path | None,
+    left_path: str | Path | None,
+    calib_dir: str | Path | None,
+    calibration_path: str | Path | None,
+    out_dir: Path,
+    tag_scale: float,
+) -> tuple:
+    """
+    Stereo calibration of this job. With photographs of the free AprilTag disc (calib/0 and calib/1 next to
+    rig/, or --calib-dir), turntable_poses.py runs on them and its turntable_calib.json is used. Without them
+    the stored calibration is used (--calib, otherwise assets/rig_calibration.json).
+    Returns (calibration file or None for the default, description for the manifest).
+    """
+    from photogrammetry.rig_calibration import DEFAULT_CALIBRATION_PATH
+    from photogrammetry.turntable_calibration import (
+        TurntableCalibrationConfig,
+        find_calibration_images,
+        run_turntable_calibration,
+    )
+
+    if calib_dir is None:
+        # <job>/rig -> <job>/calib, or <job>/rig/0/f_150.jpg -> <job>/calib (paths as given: no symlink resolution)
+        if rig_dir:
+            candidate = Path(rig_dir).absolute().parent / "calib"
+        elif left_path:
+            candidate = Path(left_path).absolute().parent.parent.parent / "calib"
+        else:
+            candidate = Path("input_images/calib").absolute()
+        if find_calibration_images(candidate):
+            calib_dir = candidate
+    if calib_dir is not None:
+        log.info("=" * 70)
+        log.info("CALIBRARE RIG: turntable_poses.py pe pozele discului din %s", calib_dir)
+        log.info("=" * 70)
+        res = run_turntable_calibration(calib_dir, out_dir / "calibration", TurntableCalibrationConfig(tag_scale=tag_scale))
+        if calibration_path:
+            log.warning("--calib %s ignored: this job has its own disc photographs.", calibration_path)
+        return res.calib_path, {"source": "turntable_poses", **res.to_dict()}
+
+    stored = Path(calibration_path) if calibration_path else DEFAULT_CALIBRATION_PATH
+    log.warning("No disc photographs for this job (calib/0, calib/1): turntable_poses.py not run, "
+                "using the stored calibration %s.", stored)
+    return calibration_path, {"source": "stored", "calib": str(stored)}
+
+
 def run_photogrammetry_pipeline(
     rig_dir: str | Path | None = None,
     left_path: str | Path | None = None,
@@ -128,6 +189,8 @@ def run_photogrammetry_pipeline(
     refine_with_features: bool = True,
     reconstruction_mode: str = "dense",
     calibration_path: str | Path | None = None,
+    spectacles: bool = True,
+    calib_dir: str | Path | None = None,
 ) -> Dict[str, Any]:
     """
     Executes the multi-stage photogrammetry pipeline.
@@ -161,14 +224,14 @@ def run_photogrammetry_pipeline(
         pairs = ingestor.ingest_rig_directory(rig_dir)
         if not pairs:
             raise FileNotFoundError(f"No valid stereo pairs found in rig directory: {rig_dir}")
-        ingestion_res = pairs[0]
+        ingestion_res = _latest_pair(pairs)
     else:
         default_rig = Path("input_images/rig")
         if default_rig.is_dir() and (default_rig / "0").is_dir() and (default_rig / "1").is_dir():
             pairs = ingestor.ingest_rig_directory(default_rig)
             if not pairs:
                 raise FileNotFoundError(f"No stereo pairs found in {default_rig}")
-            ingestion_res = pairs[0]
+            ingestion_res = _latest_pair(pairs)
         else:
             raise ValueError("Please provide either --rig-dir or -l / --left and -r / --right.")
 
@@ -211,6 +274,11 @@ def run_photogrammetry_pipeline(
     if reconstruction_mode == "dense":
         from photogrammetry.face_pipeline import FacePipelineConfig, reconstruct_face_pair
 
+        job_calibration, calibration_info = _job_rig_calibration(
+            rig_dir, left_path, calib_dir, calibration_path, out_dir, tag_scale,
+        )
+        summary_report["calibration"] = calibration_info
+
         log.info("=" * 70)
         log.info("ETAPA 2-7: RECONSTRUCȚIE DENSĂ DIN DOUĂ VEDERI (CALIBRARE RIG + MEDIAPIPE + DIS)")
         log.info("=" * 70)
@@ -218,7 +286,8 @@ def run_photogrammetry_pipeline(
             ingestion_res.cam0_meta.path,
             ingestion_res.cam1_meta.path,
             out_dir,
-            FacePipelineConfig(calibration_path=calibration_path, name=name),
+            FacePipelineConfig(calibration_path=job_calibration, name=name, spectacles=spectacles,
+                               calibration_info=calibration_info),
         )
         summary_report["stages_completed"].append("stage_2_7_dense_two_view_face")
         summary_report["artifacts"].update({k: str(v) for k, v in face_res.deliverables.items()})
@@ -754,6 +823,20 @@ Examples:
              "or a turntable_calib.json from turntable_poses.py",
     )
     parser.add_argument(
+        "--calib-dir",
+        default=None,
+        help="--mode dense: photographs of the free AprilTag disc (subfolders 0/ and 1/, f_<level><step>.jpg) on "
+             "which turntable_poses.py calibrates the rig for this job (default: a 'calib' folder next to the rig "
+             "folder, if present; otherwise the stored calibration is used)",
+    )
+    parser.add_argument(
+        "--no-spectacles",
+        dest="spectacles",
+        action="store_false",
+        help="--mode dense: the subject wears no glasses; the spectacle-frame mask and the lens regions are turned "
+             "off, so eyebrows, lash lines and eyelids are measured as surface",
+    )
+    parser.add_argument(
         "--rectify-native",
         action="store_true",
         help="Also compute and export native 12.3MP rectified images for master texture baking",
@@ -775,6 +858,8 @@ Examples:
             rectify_native=args.rectify_native,
             reconstruction_mode=args.reconstruction_mode,
             calibration_path=args.calib,
+            spectacles=args.spectacles,
+            calib_dir=args.calib_dir,
         )
     except Exception as e:
         log.error("Pipeline failure: %s", e, exc_info=True)

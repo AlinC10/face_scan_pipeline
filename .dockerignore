@@ -26,3 +26,10 @@ deprecated/
 build/
 dist/
 *.egg-info/
+
+# Keys and local-only material (never in the image)
+.env
+results/
+tools/
+main.tex
+docs/plans/

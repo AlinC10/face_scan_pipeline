@@ -49,11 +49,11 @@ Proiectul construiește un sistem automatizat de scanare facială 3D de înaltă
   * Controlul fizic al rig-ului pe RPi 5 este implementat direct în `/home/alin/Desktop/3d-scanner-raspberry-pi/` conform [`PLAN_FACE_SCAN.md`](/home/alin/Desktop/3d-scanner-raspberry-pi/PLAN_FACE_SCAN.md).
   * Vechile module mecatronice standalone au fost mutate în [`deprecated/mechatronics_capture/`](deprecated/mechatronics_capture/).
 * **Documentație & Status Planuri:**
-  * [`docs/implemented/PLAN_AUTOFRAMING_SCANNER.md`](docs/implemented/PLAN_AUTOFRAMING_SCANNER.md) — **[DONE & INTEGRAT ÎN SCANNER]**
-  * [`docs/implemented/PLAN_FOCUS_AND_EXPORTS.md`](docs/implemented/PLAN_FOCUS_AND_EXPORTS.md) — **[DONE]**
-  * [`docs/implemented/PLAN_REFACTORING_SI_DETALII_3D.md`](docs/implemented/PLAN_REFACTORING_SI_DETALII_3D.md) — **[DONE]**
-  * [`docs/implemented/IDEI_IMBUNATATIRI_RECONSTRUCT.md`](docs/implemented/IDEI_IMBUNATATIRI_RECONSTRUCT.md) — **[DONE]**
-  * [`docs/PLAN_RUNPOD_PHOTOGRAMMETRY.md`](docs/PLAN_RUNPOD_PHOTOGRAMMETRY.md) — **[GATA PENTRU CLOUD DEPLOYMENT]**
+  * [`docs/plans/implemented/PLAN_AUTOFRAMING_SCANNER.md`](docs/plans/implemented/PLAN_AUTOFRAMING_SCANNER.md) — **[DONE & INTEGRAT ÎN SCANNER]**
+  * [`docs/plans/implemented/PLAN_FOCUS_AND_EXPORTS.md`](docs/plans/implemented/PLAN_FOCUS_AND_EXPORTS.md) — **[DONE]**
+  * [`docs/plans/implemented/PLAN_REFACTORING_SI_DETALII_3D.md`](docs/plans/implemented/PLAN_REFACTORING_SI_DETALII_3D.md) — **[DONE]**
+  * [`docs/plans/implemented/IDEI_IMBUNATATIRI_RECONSTRUCT.md`](docs/plans/implemented/IDEI_IMBUNATATIRI_RECONSTRUCT.md) — **[DONE]**
+  * [`docs/plans/PLAN_RUNPOD_PHOTOGRAMMETRY.md`](docs/plans/PLAN_RUNPOD_PHOTOGRAMMETRY.md) — **[GATA PENTRU CLOUD DEPLOYMENT]**
 * **Obiective Realizate & Validate:**
   1. Auto-încadrare mecatronică pe verticală (`sweep_best_score` sau `direct_stop`) cu Z-stepper și endstop-uri.
   2. Detecție concomitentă dual-camera la 27° (Camera 0 profil drept, Camera 1 profil stâng, ambele nas).
@@ -64,11 +64,11 @@ Proiectul construiește un sistem automatizat de scanare facială 3D de înaltă
   7. Export complet în cele 8 livrabile standard conform convenției: `high_model.*` și `low_model.*` (`obj`, `glb`, `stl`, `3mf`).
 
 ### FAZA 2 (Prioritate Medie - Pasul Următor):
-* **Fișier de plan:** [`docs/PLAN_HYBRID_STUDIO.md`](docs/PLAN_HYBRID_STUDIO.md).
+* **Fișier de plan:** [`docs/plans/PLAN_HYBRID_STUDIO.md`](docs/plans/PLAN_HYBRID_STUDIO.md).
 * **Obiectiv:** Interfață web interactivă de studio pentru streaming live dual-camera, reglaje de expunere/focus, vizualizare 3D în timp real și declanșare scanare.
 
 ### FAZA 3 (Deprioritizat - Arhivă Cercetare Viitoare):
-* **Folder documente:** [`docs/flame/`](docs/flame/) (`PLAN_MVP_FLAME.md`, `PLAN_FIX_DEFORMATION.md`).
+* **Arhivă:** [`deprecated/flame/`](deprecated/flame/) (`generator_engine.py`, `run_generator.sh`, șabloanele FLAME în `assets/`, planurile în `docs/`: `PLAN_MVP_FLAME.md`, `PLAN_FIX_DEFORMATION.md`).
 * **Status:** Pus pe pauză din cauza deformărilor anatomice ale fitting-ului monocular. Nu se lucrează pe el în acest stadiu.
 
 ---
@@ -125,14 +125,26 @@ Toate scripturile de reconstrucție 3D folosesc mediul virtual local `.venv`.
 # 3. Rulare pipeline fotogrametrie densă (CREStereo / Poisson):
 python run_photogrammetry_windows.py --rig-dir input_images/rig -o output/
 
-# 4. Reconstrucție facială densă din două vederi (implicit în Docker; calibrare din assets/rig_calibration.json):
+# 4. Reconstrucție facială densă din două vederi (implicit în Docker; calibrare cu turntable_poses.py din
+#    input_images/calib dacă există, altfel assets/rig_calibration.json):
 python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/
+
+# 5. Același job în cloud (pod RunPod doar cu CPU, R2):
+python tools/cloud_scan.py --name test --no_spectacles
 ```
 
 > [!NOTE]
 > Geometria măsurată a rig-ului (calibrare AprilTag din Turntable Studio, `assets/rig_calibration.json`):
 > baza $B = 164.3$ mm și rotația relativă între camere $19.7^\circ$ (nu $27^\circ$ cât presupun valorile nominale).
 > Pipeline-ul dens rafinează pe fiecare captură rotația relativă (corecții tipice < 1°), păstrând lungimea bazei.
+
+> [!IMPORTANT]
+> [`photogrammetry/turntable_poses.py`](photogrammetry/turntable_poses.py) este copiat **nemodificat** din Turntable Studio
+> (`template_meshroom/turntable_studio/pipeline/turntable_poses.py`, regula lor RULE 1): nu se editează, se apelează doar
+> ca proces separat prin [`photogrammetry/turntable_calibration.py`](photogrammetry/turntable_calibration.py). Rulează la
+> fiecare job care are pozele discului liber în `calib/0` și `calib/1` lângă `rig/` (în perechea facială discul nu se vede).
+> Fluxul cloud ([`cloud/`](cloud/), [`runpod_job.py`](runpod_job.py), [`tools/cloud_scan.py`](tools/cloud_scan.py)) este
+> adaptat din același proiect: pod RunPod doar cu CPU, joburi sub `face_jobs/<id>/` în R2.
 
 > [!NOTE]
 > Captura mecatronică și comanda fizică a motoarelor pe Raspberry Pi 5 se declanșează nativ din daemonul scanerului ([`PLAN_FACE_SCAN.md`](/home/alin/Desktop/3d-scanner-raspberry-pi/PLAN_FACE_SCAN.md)) prin endpoint-ul `POST /scanner/face/capture`.
