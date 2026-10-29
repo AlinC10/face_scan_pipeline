@@ -125,3 +125,8 @@ def test_runner_finds_calib_next_to_rig_and_falls_back():
         assert seen["calib_dir"] == (job / "calib").absolute()
         assert info["source"] == "turntable_poses"
         assert path.name == "turntable_calib.json"
+
+
+from tests._functional import function_tests  # noqa: E402
+
+load_tests = function_tests(globals())

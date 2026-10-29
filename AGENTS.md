@@ -147,4 +147,11 @@ python tools/cloud_scan.py --name test --no_spectacles
 > adaptat din același proiect: pod RunPod doar cu CPU, joburi sub `face_jobs/<id>/` în R2.
 
 > [!NOTE]
+> Capul întreg vine din **GNM Head v3** (Google, `assets/gnm_head.npz`, gitignored, descărcat de
+> `photogrammetry.gnm_head.ensure_model()` cu SHA-256; imaginea Docker îl include). Evaluatorul numpy coincide cu
+> `gnm_numpy` oficial (fixture `tests/data/gnm_official_reference.npz`). Expresiile semantice ajung doar în GLB-ul low
+> (morph targets); UI-ul doar vizualizează GLB/STL. Fără GNM: `--head-model none`.
+> Teste: `.venv/bin/python -m unittest discover -s tests -t .`; livrabile: `python tools/check_deliverables.py output/`.
+
+> [!NOTE]
 > Captura mecatronică și comanda fizică a motoarelor pe Raspberry Pi 5 se declanșează nativ din daemonul scanerului ([`PLAN_FACE_SCAN.md`](/home/alin/Desktop/3d-scanner-raspberry-pi/PLAN_FACE_SCAN.md)) prin endpoint-ul `POST /scanner/face/capture`.

@@ -1,20 +1,28 @@
-# Pachetele imaginii Docker (pipeline-ul facial dens + fluxul RunPod / R2). Fără PyTorch: modul dense rulează
-# doar pe CPU și nu-l folosește (requirements.txt = acestea + PyTorch pentru CREStereo / scripturile locale).
-
-# Reconstrucție de suprafață & decimare mesh
-open3d>=0.18.0
+# Pachetele imaginii Docker (pipeline-ul facial dens + fluxul RunPod / R2), Python 3.12.
+# Fără PyTorch: modul dense rulează doar pe CPU. requirements.txt = acestea + PyTorch și unelte locale.
+# open3d-cpu se instalează separat, fără dependențe (Dockerfile): din ele, la import, cere doar plotly și dash.
 
 # Viziune computațională & repere faciale 3D
 mediapipe>=0.10.14
 opencv-contrib-python>=4.8.0.76
 
 # Geometrie 3D, atlas UV & export multi-format (OBJ, GLB, STL, 3MF)
-trimesh[all]>=4.0.0
 numpy>=1.24.0,<2.0.0
 scipy>=1.10.0
+trimesh>=4.0.0
+networkx>=3.0
+lxml>=5.0
 pillow>=10.0.0
 xatlas>=0.0.9
 piexif>=1.1.3
+DracoPy>=1.4.0          # compresia Draco a geometriei GLB (KHR_draco_mesh_compression)
+
+# Open3D (decimare QEM): modulele importate de `import open3d`
+plotly>=5.0
+dash>=2.0
+
+# Telemetrie (stats.json) și resursele containerului
+psutil>=5.9
 
 # Cloud: Cloudflare R2 (S3) și RunPod REST
 boto3>=1.34.0

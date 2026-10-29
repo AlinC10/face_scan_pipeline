@@ -1,0 +1,2 @@
+# Instalat cu --no-deps (vezi Dockerfile): varianta CPU, fără CUDA și fără dependențele de vizualizare.
+open3d-cpu>=0.19.0

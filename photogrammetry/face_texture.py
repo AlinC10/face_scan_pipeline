@@ -7,16 +7,17 @@ Bakes an albedo atlas for a UV-unwrapped facial mesh from the two original
   1. UV atlas: xatlas charts packed into a square texture.
   2. Texel geometry: every texel inside a chart gets its 3-D position and normal
      (barycentric interpolation over its triangle).
-  3. Visibility: the mesh is rendered into a depth buffer per camera; a texel is
-     visible if it is not behind that surface and faces the camera.
+  3. Visibility: the surface without the measured detail is rendered into a depth buffer per camera
+     (half the photo resolution); a texel is visible if it is not behind it (soft ramp, 3 mm tolerance)
+     and faces the camera. The weights are smoothed over neighbouring texels (no flicker, no stripes).
   4. Weights: w_c = visible · cos(θ_c)^3 · border fade, where θ_c is the angle
      between the normal and the ray to camera c.
-  5. Colour balance: per-channel gains from texels seen well by both cameras,
-     split evenly between them (like the per-camera gains of the object pipeline).
+  5. Colour balance: a smooth per-channel gain map (sigma 15 mm) from texels seen well by both cameras,
+     split evenly between them.
   6. Two-band blending: the low frequencies (σ = 6 px) are averaged with w_c,
      the high frequencies come from the most frontal camera (weights w_c^8),
      which keeps the pores sharp and avoids ghosting from residual misalignment.
-  7. Unseen texels are inpainted and the charts are padded (gutter).
+  7. Unseen / grazing texels: harmonic fill of the low band on the mesh (Laplace); charts padded.
 
 A tangent-space normal map of the high-polygon surface can also be baked onto
 the low-polygon atlas.
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -145,12 +147,24 @@ def _raster_block(tp, lo, k, ids, shape, face_id, bary, depth, best):
 # UV atlas
 # ---------------------------------------------------------------------------------------------
 
-def unwrap_uv(mesh: trimesh.Trimesh, resolution: int) -> trimesh.Trimesh:
-    """xatlas atlas; returns a mesh whose vertices are split along the chart seams, with UVs."""
+def unwrap_uv(mesh: trimesh.Trimesh, resolution: int, density: Optional[np.ndarray] = None,
+              min_density: float = 0.35) -> trimesh.Trimesh:
+    """
+    xatlas atlas; returns a mesh whose vertices are split along the chart seams, with UVs.
+    `density` (per vertex, 0..1): where it is low the surface is shrunk (towards the centroid of the dense part)
+    before the unwrap, so it takes less of the atlas: the measured face keeps its texel density on a whole head
+    whose back is only filled in. The returned mesh keeps the real positions.
+    """
     import xatlas
 
+    pos = mesh.vertices
+    if density is not None:
+        dens = np.clip(np.asarray(density, dtype=np.float64), 0.0, 1.0)
+        c = pos[dens > 0.5].mean(axis=0) if (dens > 0.5).any() else pos.mean(axis=0)
+        s = min_density + (1.0 - min_density) * dens
+        pos = c + (pos - c) * s[:, None]
     atlas = xatlas.Atlas()
-    atlas.add_mesh(mesh.vertices.astype(np.float32), mesh.faces.astype(np.uint32))
+    atlas.add_mesh(pos.astype(np.float32), mesh.faces.astype(np.uint32))
     pack = xatlas.PackOptions()
     pack.resolution = resolution
     pack.padding = 4
@@ -213,51 +227,83 @@ def bake_albedo(
     mesh: trimesh.Trimesh,
     cameras: List[TextureCamera],
     size: int = 4096,
-    visibility_scale: float = 0.25,
-    depth_tolerance: float = 1.5,
+    visibility_scale: float = 0.5,
+    depth_tolerance: float = 3.0,
     low_sigma_px: float = 6.0,
     sharpness: float = 8.0,
+    visibility_mesh: Optional[trimesh.Trimesh] = None,
+    gain_sigma_mm: Optional[float] = 15.0,
+    weak_weight: float = 0.05,
+    debug_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
-    """Two-band, visibility-aware albedo atlas (BGR uint8, size x size) for a UV mesh."""
+    """
+    Two-band, visibility-aware albedo atlas (BGR uint8, size x size) for a UV mesh (mesh frame in mm).
+
+    * Visibility: depth buffer of `visibility_mesh` (the surface without the measured detail; default the
+      mesh itself) at `visibility_scale` of the photographs, with a tolerance above the detail amplitude,
+      and a soft ramp instead of a hard test, so neighbouring texels do not flicker between cameras.
+    * Colour balance: a smooth gain map cam0 / cam1 (sigma `gain_sigma_mm` over the face, in the mesh
+      x-y plane) from texels both cameras see well, instead of one global gain (None: global gain only).
+      The visibility tolerance grows with the local depth slope of the buffer (grazing surfaces).
+    * Unseen or grazing texels (total weight < `weak_weight`): harmonic (Laplace) fill of the low band over
+      the mesh surface from the well-seen texels around them, blended in as the weight drops: no edges.
+    """
     covered, f, b, pos, nrm = _texel_geometry(mesh, size)
     n_tex = len(pos)
+    vis_mesh = visibility_mesh if visibility_mesh is not None else mesh
 
-    weights, lows, highs = [], [], []
+    weights, lows, highs, visible_l = [], [], [], []
     for cam in cameras:
         px, z = cam.project(pos)
-        depth = _depth_buffer(mesh, cam, visibility_scale)
+        depth = _depth_buffer(vis_mesh, cam, visibility_scale)
+        slope = _depth_slope(depth)
         q = np.clip((px * visibility_scale).round().astype(int), 0, [depth.shape[1] - 1, depth.shape[0] - 1])
-        visible = z <= depth[q[:, 1], q[:, 0]] + depth_tolerance
+        # Nearest-pixel lookups on a steep (grazing) surface are off by up to half a pixel of depth change,
+        # so the tolerance grows with the local slope. depth = inf outside the surface: visible.
+        tol = depth_tolerance + 1.5 * slope[q[:, 1], q[:, 0]]
+        dz = depth[q[:, 1], q[:, 0]] + tol - z
+        vis = np.clip(dz / tol, 0.0, 1.0)
+        vis[~np.isfinite(dz)] = 1.0
         ray = cam.centre - pos
         ray /= np.linalg.norm(ray, axis=1, keepdims=True)
         cos = np.clip(np.sum(nrm * ray, axis=1), 0.0, 1.0)
         h, w = cam.image.shape[:2]
         border = np.minimum.reduce([px[:, 0], px[:, 1], w - 1 - px[:, 0], h - 1 - px[:, 1]])
         fade = np.clip(border / 100.0, 0.0, 1.0)
-        wgt = np.where(visible, cos ** 3 * fade, 0.0)
+        wgt = _smooth_texel_values(vis * cos ** 3 * fade, covered, sigma=2.0)
         img, low_img = cam.bands(low_sigma_px)
-        low = _sample(low_img, px)
+        low = _sample(img=low_img, px=px)
         high = _sample(img, px) - low
         weights.append(wgt)
         lows.append(low)
         highs.append(high)
+        visible_l.append(vis > 0.5)
         log.info("Texture camera: %.0f%% of the texels visible", 100.0 * np.mean(wgt > 0))
 
     W = np.stack(weights)                                       # (C, N)
-    # Colour balance between the cameras on texels both see well.
     stats: Dict[str, float] = {}
     if len(cameras) == 2:
         both = (W[0] > 0.3) & (W[1] > 0.3)
         if both.sum() > 1000:
             ratio = np.median((lows[0][both] + 1.0) / (lows[1][both] + 1.0), axis=0)
-            ratio = np.clip(ratio, 0.5, 2.0)
-            g = np.sqrt(ratio)
+            stats["colour_gain_cam1_to_cam0_bgr"] = [round(float(x), 4) for x in ratio]
+            if gain_sigma_mm:
+                gain = _local_gain(pos, lows[0], lows[1], both, sigma_mm=gain_sigma_mm, global_ratio=ratio)
+            else:
+                gain = np.broadcast_to(np.clip(ratio, 0.5, 2.0), lows[0].shape)
+            g = np.sqrt(gain)
             lows[0] /= g
             highs[0] /= g
             lows[1] *= g
             highs[1] *= g
-            stats["colour_gain_cam1_to_cam0_bgr"] = [round(float(x), 4) for x in ratio]
-            log.info("Colour balance cam1 -> cam0 (B, G, R): %s", np.round(ratio, 3))
+            log.info("Colour balance cam1 -> cam0: global (B, G, R) %s, local gain range %.3f-%.3f",
+                     np.round(ratio, 3), float(gain.min()), float(gain.max()))
+            sel = (W[0] > 0) & (W[1] > 0)
+            dE = _delta_e(lows[0][sel], lows[1][sel])
+            stats["camera_delta_e_median"] = round(float(np.median(dE)), 2)
+            stats["camera_delta_e_p90"] = round(float(np.percentile(dE, 90)), 2)
+            log.info("Colour difference between the cameras after balancing: dE median %.1f, p90 %.1f",
+                     stats["camera_delta_e_median"], stats["camera_delta_e_p90"])
 
     wsum = W.sum(axis=0)
     seen = wsum > 1e-6
@@ -267,17 +313,19 @@ def bake_albedo(
     high = sum(Ws[c][:, None] * highs[c] for c in range(len(cameras))) / np.maximum(wssum, 1e-30)[:, None]
     colour = np.clip(low + high, 0, 255)
 
-    tex = np.zeros((size, size, 3), np.uint8)
+    # Texels no camera sees, or sees only at a grazing angle (e.g. under the nose, the cameras look down):
+    # smooth low-band colour of the nearest well-seen surface (Gaussian weights in 3-D), blended in as the
+    # total weight drops, so there is no edge where the photographs end.
+    strong = wsum >= weak_weight
+    weak = ~strong
     rows, cols = np.nonzero(covered)
-    tex[rows[seen], cols[seen]] = colour[seen].astype(np.uint8)
+    if weak.any() and strong.any():
+        fill = mesh_harmonic_fill(mesh, f, b, low, strong)[weak]
+        alpha = np.clip(wsum[weak] / weak_weight, 0.0, 1.0)[:, None] ** 2
+        colour[weak] = alpha * colour[weak] + (1.0 - alpha) * fill
 
-    # Texels no camera sees (e.g. under the nose, the cameras look down): colour of the
-    # nearest seen surface point in 3-D, then a light blur so the patch has no texture noise.
-    if (~seen).any() and seen.any():
-        tree = cKDTree(pos[seen][::4])
-        _, nn = tree.query(pos[~seen], k=8)
-        fill = colour[seen][::4][nn].mean(axis=1)
-        tex[rows[~seen], cols[~seen]] = fill.astype(np.uint8)
+    tex = np.zeros((size, size, 3), np.uint8)
+    tex[rows, cols] = colour.astype(np.uint8)
     tex = add_gutter(tex, covered)
     stats.update({
         "texture_size": size,
@@ -285,7 +333,134 @@ def bake_albedo(
         "texels_seen_fraction": round(float(seen.mean()), 4),
         "texels_seen_by_both_fraction": round(float(np.mean((W > 0).all(axis=0))), 4) if len(cameras) > 1 else 0.0,
     })
+    if debug_dir is not None and len(cameras) == 2:
+        _save_texture_debug(Path(debug_dir), size, covered, W, visible_l, lows)
     return tex, stats
+
+
+def _depth_slope(depth: np.ndarray) -> np.ndarray:
+    """Largest depth change to a 4-neighbour (mm per depth-buffer pixel); 0 where undefined."""
+    d = np.where(np.isfinite(depth), depth, np.nan)
+    slope = np.zeros_like(d)
+    for axis in (0, 1):
+        g = np.abs(np.diff(d, axis=axis))
+        g = np.nan_to_num(g, nan=0.0)
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (0, 1)
+        slope = np.maximum(slope, np.pad(g, pad))
+        pad[axis] = (1, 0)
+        slope = np.maximum(slope, np.pad(g, pad))
+    return np.minimum(slope, 20.0)          # occlusion edges: the depth jump itself must not hide them
+
+
+def _smooth_texel_values(values: np.ndarray, covered: np.ndarray, sigma: float) -> np.ndarray:
+    """Mask-aware Gaussian blur of per-texel values in the atlas (removes texel-to-texel flicker)."""
+    img = np.zeros(covered.shape, np.float32)
+    img[covered] = values
+    num = cv2.GaussianBlur(img, (0, 0), sigma)
+    den = cv2.GaussianBlur(covered.astype(np.float32), (0, 0), sigma)
+    out = num / np.maximum(den, 1e-6)
+    return np.where(values > 0, out[covered], 0.0)       # never make an invisible texel visible
+
+
+def _local_gain(pos, low0, low1, both, sigma_mm: float, global_ratio, cell_mm: float = 2.0) -> np.ndarray:
+    """
+    Per-texel cam1 -> cam0 colour gain: log-ratio of the low bands where both cameras see well,
+    smoothed on a grid over the mesh x-y plane (normalized convolution), global ratio where unsupported.
+    """
+    xy = pos[:, :2]
+    lo = xy.min(axis=0)
+    grid = np.floor((xy - lo) / cell_mm).astype(int)
+    gh, gw = grid[:, 1].max() + 1, grid[:, 0].max() + 1
+    flat = grid[:, 1] * gw + grid[:, 0]
+    logr = np.log((low0 + 1.0) / (low1 + 1.0))
+    sig = sigma_mm / cell_mm
+    out = np.empty_like(logr)
+    cnt = np.bincount(flat[both], minlength=gh * gw).reshape(gh, gw).astype(np.float32)
+    den = cv2.GaussianBlur(cnt, (0, 0), sig)
+    for ch in range(logr.shape[1]):
+        acc = np.bincount(flat[both], weights=logr[both, ch], minlength=gh * gw).reshape(gh, gw).astype(np.float32)
+        num = cv2.GaussianBlur(acc, (0, 0), sig)
+        g_log = np.log(float(global_ratio[ch]))
+        support = np.clip(den / max(float(den.max()) * 0.05, 1e-6), 0.0, 1.0)
+        field = np.where(den > 1e-6, num / np.maximum(den, 1e-6), g_log)
+        field = support * field + (1.0 - support) * g_log
+        out[:, ch] = field.ravel()[flat]
+    return np.clip(np.exp(out), 0.5, 2.0)
+
+
+def mesh_harmonic_fill(mesh: trimesh.Trimesh, tex_face: np.ndarray, tex_bary: np.ndarray, values: np.ndarray,
+                       known: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    """
+    Harmonic (Laplace) interpolation of per-texel `values` over the SURFACE, not the atlas: the well-seen
+    texels give the colour of the mesh vertices they cover; the other vertices solve L x = 0 on the vertex
+    graph (UV seams merged, so charts are connected as on the face); every texel then takes the barycentric
+    interpolation. Smooth, continuous across charts, correct even for a chart nobody sees.
+    """
+    from scipy.sparse import coo_matrix, identity
+    from scipy.sparse.linalg import spsolve
+
+    V = np.asarray(mesh.vertices)
+    # Seam duplicates (same position, different UV) -> one graph vertex
+    _, inv = np.unique(np.round(V / 1e-4).astype(np.int64), axis=0, return_inverse=True)
+    inv = inv.ravel()
+    n = int(inv.max()) + 1
+    F = inv[np.asarray(mesh.faces)]
+    tri = F[tex_face]                                            # (T, 3) graph vertices of each texel
+    wk = tex_bary * known[:, None]
+    acc_w = np.bincount(tri.ravel(), weights=wk.ravel(), minlength=n)
+    acc_v = np.stack([np.bincount(tri.ravel(), weights=(wk * values[:, c:c + 1]).ravel(), minlength=n)
+                      for c in range(values.shape[1])], axis=1)
+    is_known = acc_w > 0.5
+    x = np.zeros((n, values.shape[1]))
+    x[is_known] = acc_v[is_known] / acc_w[is_known, None]
+    unknown = ~is_known
+    if unknown.any():
+        e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+        e = np.unique(np.sort(e, axis=1), axis=0)
+        A = coo_matrix((np.ones(2 * len(e)), (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])), shape=(n, n)).tocsr()
+        L = (coo_matrix((np.asarray(A.sum(axis=1)).ravel(), (np.arange(n), np.arange(n))), shape=(n, n)) - A).tocsr()
+        U = np.nonzero(unknown)[0]
+        K = np.nonzero(is_known)[0]
+        Luu = L[U][:, U] + eps * identity(len(U), format="csr")   # eps: components without known vertices
+        rhs = -(L[U][:, K] @ x[K]) + eps * x[K].mean(axis=0)
+        x[U] = np.column_stack([spsolve(Luu.tocsc(), rhs[:, c]) for c in range(values.shape[1])])
+    return (x[tri] * tex_bary[..., None]).sum(axis=1)
+
+
+def _delta_e(bgr0: np.ndarray, bgr1: np.ndarray) -> np.ndarray:
+    lab0 = cv2.cvtColor(np.clip(bgr0, 0, 255).astype(np.uint8)[None], cv2.COLOR_BGR2LAB)[0].astype(np.float32)
+    lab1 = cv2.cvtColor(np.clip(bgr1, 0, 255).astype(np.uint8)[None], cv2.COLOR_BGR2LAB)[0].astype(np.float32)
+    # OpenCV 8-bit Lab: L scaled by 255/100, a/b offset by 128
+    lab0[:, 0] *= 100.0 / 255.0
+    lab1[:, 0] *= 100.0 / 255.0
+    return np.linalg.norm(lab0 - lab1, axis=1)
+
+
+def _save_texture_debug(folder: Path, size, covered, W, visible_l, lows) -> None:
+    """Visibility (red cam0, green cam1), weight share of cam0 and colour difference maps of the atlas."""
+    folder.mkdir(parents=True, exist_ok=True)
+    rows, cols = np.nonzero(covered)
+    small = (1024, 1024)
+
+    def put(values, cmap=None):
+        img = np.zeros((size, size), np.float32)
+        img[rows, cols] = values
+        u8 = np.clip(img * 255, 0, 255).astype(np.uint8)
+        col = cv2.applyColorMap(u8, cmap) if cmap is not None else cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        col[~covered] = 0
+        return cv2.resize(col, small, interpolation=cv2.INTER_AREA)
+
+    vis = np.zeros((size, size, 3), np.uint8)
+    vis[rows, cols, 2] = visible_l[0] * 255
+    vis[rows, cols, 1] = visible_l[1] * 255
+    cv2.imwrite(str(folder / "texture_visibility_r_cam0_g_cam1.jpg"), cv2.resize(vis, small, interpolation=cv2.INTER_AREA))
+    cv2.imwrite(str(folder / "texture_weight_share_cam0.jpg"),
+                put(W[0] / np.maximum(W.sum(0), 1e-9), cv2.COLORMAP_COOL))
+    sel = (W[0] > 0) & (W[1] > 0)
+    dE = np.zeros(len(rows), np.float32)
+    dE[sel] = _delta_e(lows[0][sel], lows[1][sel])
+    cv2.imwrite(str(folder / "texture_colour_diff_dE_over_20.jpg"), put(dE / 20.0, cv2.COLORMAP_INFERNO))
 
 
 def add_gutter(tex: np.ndarray, covered: np.ndarray, iterations: int = 16) -> np.ndarray:

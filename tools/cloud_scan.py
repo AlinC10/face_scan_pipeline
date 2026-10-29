@@ -55,8 +55,8 @@ from cloud.job import plan_job, run_cloud_job  # noqa: E402
 
 from runpod_job import PIPELINE_OPTIONS  # noqa: E402  (what the pod accepts from JOB_JSON)
 
-# Set by the pod itself, not by --set (paths on this machine do not exist in the pod)
-RESERVED_OPTIONS = {"job_id", "rig_dir", "left_path", "right_path", "output_dir", "calib_dir", "reconstruction_mode"}
+# Set by the pod itself, not by --set (paths on this machine do not exist in the pod); = PATH_OPTIONS + job_id
+RESERVED_OPTIONS = {"job_id", "rig_dir", "left_path", "right_path", "output_dir", "calib_dir", "layout_path"}
 
 
 def parse_set(items) -> dict:
@@ -154,7 +154,7 @@ def main(argv=None) -> int:
         job_id = f"{label}-{r2.new_job_id()}" if label else None
 
     if not args.dry_run and not args.yes:
-        plan = plan_job(args.input_dir, args.min_vcpu)
+        plan = plan_job(args.input_dir, args.min_vcpu, int(options.get("texture_size", 4096)))
         print(f"\n{plan['n_face_photos']} face + {plan['n_calib_photos']} disc photos ({plan['input_gb']:.2f} GB) "
               f"from {args.input_dir}")
         if rp.COMPUTE_TYPE == "GPU":

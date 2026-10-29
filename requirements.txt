@@ -24,3 +24,5 @@ piexif>=1.1.3
 boto3>=1.34.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+psutil>=5.9
+DracoPy>=1.4.0

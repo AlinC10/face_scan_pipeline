@@ -28,9 +28,8 @@ from cloud import runpod as rp
 logger = logging.getLogger("FaceScan.CloudJob")
 
 DEFAULT_IMAGE_ENV = "FACE_SCAN_IMAGE"
-# Peak RAM of the face pipeline on one 12.3 MP pair: 8.9 GB measured (2 x 4056 x 3040, 4096 px atlas), whatever
-# the number of disc photos (turntable_poses.py detects their tags one image per process).
-FACE_RAM_GB = 9.0
+# Peak RAM of the face pipeline: photogrammetry.resources.estimate_ram_gb (dominated by the texture atlas;
+# 9.7 GB measured with the GNM head for a 12.3 MP pair and a 4096 px atlas), whatever the number of disc photos.
 RAM_MARGIN = 1.3
 DEFAULT_MIN_VCPU = 8
 
@@ -69,7 +68,7 @@ def _merge_cloud_stats(stats_path: Path, report: Dict[str, Any], runs) -> None:
         logger.warning(f"Could not add the cloud data to {stats_path}: {e}")
 
 
-def plan_job(input_dir: str, min_vcpu: int = DEFAULT_MIN_VCPU) -> Dict[str, Any]:
+def plan_job(input_dir: str, min_vcpu: int = DEFAULT_MIN_VCPU, texture_size: int = 4096) -> Dict[str, Any]:
     """
     Photos of the job and the pod requirements. input_dir must hold the face pair in rig/0 and rig/1;
     calib/0 and calib/1 (disc photos for turntable_poses.py) are optional.
@@ -81,8 +80,8 @@ def plan_job(input_dir: str, min_vcpu: int = DEFAULT_MIN_VCPU) -> Dict[str, Any]
     n_calib = sum(1 for rel in files if rel.startswith(("calib/0/", "calib/1/")))
     width, height = _image_size(next(iter(face.values())))
     input_gb = sum(os.path.getsize(p) for p in files.values()) / 1024 ** 3
-    # A 12.3 MP pair needs FACE_RAM_GB; the working images scale with the pixel count.
-    estimate = FACE_RAM_GB * max(width * height / (4056 * 3040), 0.25)
+    from photogrammetry.resources import estimate_ram_gb
+    estimate = estimate_ram_gb(width, height, texture_size)
     return {
         "n_images": len(files),
         "n_face_photos": len(face),
@@ -127,7 +126,7 @@ def run_cloud_job(
     report: Dict[str, Any] = {"job_id": job_id, "bucket": bucket, "timings_s": {}, "dry_run": dry_run}
     t = report["timings_s"]
 
-    plan = plan_job(input_dir, min_vcpu)
+    plan = plan_job(input_dir, min_vcpu, int(options.get("texture_size", 4096)))
     files = plan.pop("files")
     report["plan"] = plan
     say(f"Job {job_id}: {plan['n_face_photos']} face + {plan['n_calib_photos']} disc photos ({plan['input_gb']:.2f} GB, "

@@ -53,7 +53,7 @@ class TurntableCalibrationConfig:
     lift_mm: float = 100.0
     estimate_lift: bool = True
     tag_refine: bool = True         # per-tag height / tilt (paper unevenness): RMS 4.09 -> 2.48 px in Turntable Studio
-    tag_scale: float = 1.0          # measured / designed distance of the printed tags
+    tag_scale: float = 0.98         # measured / designed size of the printed tags (this rig's disc: ~98 %)
     layout_path: Path = TAG_LAYOUT_PATH
     python_exe: Optional[str] = None
 
@@ -190,9 +190,15 @@ def run_turntable_calibration(
     calib_path = out / "turntable_calib.json"
     if not calib_path.is_file():
         raise FileNotFoundError(f"turntable_poses.py finished without writing {calib_path}")
+    # turntable_poses.py (unchanged) does not record --tagScale: add it, so load_rig_calibration() knows the
+    # metric scale is already corrected and the pipeline does not apply it a second time.
+    calib = json.loads(calib_path.read_text(encoding="utf-8"))
+    calib["tag_scale"] = float(cfg.tag_scale)
+    calib_path.write_text(json.dumps(calib, indent=2), encoding="utf-8")
     report_path = out / "turntable_report.txt"
     stats = _report_stats(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
     log.info("turntable_poses finished in %.1f s (reprojection RMS %s px)", duration,
              stats.get("reprojection_rms_px", "?"))
+    stats["tag_scale"] = float(cfg.tag_scale)
     return TurntableCalibrationResult(calib_path, report_path, out / "cameras_known.sfm",
                                       {k: len(v) for k, v in images.items()}, duration, stats)

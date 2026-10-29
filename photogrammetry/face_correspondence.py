@@ -202,6 +202,14 @@ class RectifiedFacePair:
     Q: np.ndarray
     calib: RigCalibration     # calibration at the working scale
     work_scale: float
+    maps: Optional[tuple] = None   # ((map0x, map0y), (map1x, map1y)): raw (working scale) -> rectified
+
+    def rectify_mask(self, mask_raw_full: np.ndarray, cam: int) -> np.ndarray:
+        """A full-resolution raw-image mask of camera `cam` in the rectified image (nearest neighbour)."""
+        h, w = self.left.shape[:2]
+        small = cv2.resize(mask_raw_full.astype(np.uint8), (self.maps[cam][0].shape[1], self.maps[cam][0].shape[0]),
+                           interpolation=cv2.INTER_NEAREST)
+        return cv2.remap(small, self.maps[cam][0], self.maps[cam][1], cv2.INTER_NEAREST).astype(bool)
 
     @property
     def focal_px(self) -> float:
@@ -233,7 +241,7 @@ def rectify_pair(img0: np.ndarray, img1: np.ndarray, calib_full: RigCalibration,
     left = cv2.remap(img0, m0[0], m0[1], cv2.INTER_LINEAR)
     right = cv2.remap(img1, m1[0], m1[1], cv2.INTER_LINEAR)
     log.info("Rectified pair %dx%d: f' = %.1f px, B = %.2f mm", size[0], size[1], P1[0, 0], calib.baseline_mm)
-    return RectifiedFacePair(left, right, R1, R2, P1, P2, Q, calib, work_scale)
+    return RectifiedFacePair(left, right, R1, R2, P1, P2, Q, calib, work_scale, maps=(m0, m1))
 
 
 @dataclass
@@ -270,6 +278,7 @@ def estimate_disparity(
     max_fb_error: float = 0.75,
     max_vertical_px: float = 1.0,
     mask_thin_occluders: bool = True,
+    region_mask: Optional[np.ndarray] = None,
 ) -> DisparityEstimate:
     """
     Prior-guided disparity from the `reference` view.
@@ -285,6 +294,10 @@ def estimate_disparity(
     `mask_thin_occluders` excludes spectacle frames (black-hat filter). The same filter also
     removes eyebrows, lash lines and the lip line, so it can be turned off for subjects
     scanned without glasses.
+
+    `region_mask` (rectified reference view, from the segmentation) replaces the MediaPipe mesh
+    outline as the face region: up to the hairline and the lateral cheeks. Outside the mesh the
+    initial disparity and the MediaPipe depth are extrapolated with a robust quadratic surface.
     """
     tris = tessellation_triangles()
     ref_img, other_img = (rect.left, rect.right) if reference == "left" else (rect.right, rect.left)
@@ -299,10 +312,25 @@ def estimate_disparity(
     raster = rasterize_triangles(pts, tris, np.c_[lm_d, lm_ref_depth[:NUM_MESH_LANDMARKS]], (h, w), depth_channel=1)
     covered = ~np.isnan(raster[..., 0])
     face_mask = _fill_mask_holes(covered)           # closes the eye and mouth openings
-    filled, _ = fill_by_normalized_convolution(np.nan_to_num(raster[..., 0]), covered, sigma=12.0)
+    if region_mask is not None:
+        # Up to the hairline (tall kernel) but only a little sideways: the temples and the ears are seen by one
+        # camera at a grazing angle and the height field cannot hold them (they come from the head model, P2).
+        lateral = int(round(13.0 * rect.focal_px / 270.0))          # ~13 mm at the face distance
+        vertical = int(round(60.0 * rect.focal_px / 270.0))         # ~60 mm
+        near = cv2.dilate(face_mask.astype(np.uint8),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * lateral + 1, 2 * vertical + 1)))
+        region = _fill_mask_holes(region_mask & near.astype(bool))
+        if region.sum() > 0.5 * face_mask.sum():
+            face_mask = region
+    filled, sup = fill_by_normalized_convolution(np.nan_to_num(raster[..., 0]), covered, sigma=12.0)
+    far = face_mask & ~covered
+    if far.any():
+        filled = _extrapolate_quadratic(raster[..., 0], covered, filled, sup, far)
     init = np.where(face_mask, np.where(covered, raster[..., 0], filled), 0).astype(np.float32)
     # MediaPipe relative depth: holes filled and the 468-vertex facets smoothed out.
-    zmp, _ = fill_by_normalized_convolution(np.nan_to_num(raster[..., 1]), covered, sigma=6.0)
+    zmp, sup = fill_by_normalized_convolution(np.nan_to_num(raster[..., 1]), covered, sigma=6.0)
+    if far.any():
+        zmp = _extrapolate_quadratic(raster[..., 1], covered, zmp, sup, far)
     zmp = np.where(covered, raster[..., 1], zmp)
     zmp, _ = fill_by_normalized_convolution(zmp, face_mask, sigma=4.0)
 
@@ -349,6 +377,36 @@ def estimate_disparity(
             coef[0], coef[1], sigma,
         )
     return DisparityEstimate(reference, disparity.astype(np.float32), valid, smooth_disp, prior, face_mask, fit)
+
+
+def _extrapolate_quadratic(values, known, filled, support, target, blend_support: float = 0.2):
+    """
+    `filled` (normalized convolution) where it has support, a quadratic surface fitted (robustly) on the
+    known pixels farther out: the face curves away towards the ears instead of staying flat.
+    """
+    ys, xs = np.nonzero(known)
+    step = max(1, len(xs) // 20000)
+    xs, ys = xs[::step].astype(np.float64), ys[::step].astype(np.float64)
+    v = values[ys.astype(int), xs.astype(int)].astype(np.float64)
+    cx, cy, sc = xs.mean(), ys.mean(), max(xs.std(), ys.std(), 1.0)
+
+    def basis(x, y):
+        u, w = (x - cx) / sc, (y - cy) / sc
+        return np.stack([np.ones_like(u), u, w, u * u, u * w, w * w], axis=1)
+
+    A = basis(xs, ys)
+    wts = np.ones(len(v))
+    for _ in range(5):
+        c = np.linalg.lstsq(A * wts[:, None], v * wts, rcond=None)[0]
+        r = np.abs(A @ c - v)
+        s = 1.4826 * np.median(r) + 1e-6
+        wts = np.where(r < 2.5 * s, 1.0, 2.5 * s / r)
+    ty, tx = np.nonzero(target)
+    quad = basis(tx.astype(np.float64), ty.astype(np.float64)) @ c
+    a = np.clip(support[ty, tx] / blend_support, 0.0, 1.0)
+    out = filled.copy()
+    out[ty, tx] = a * filled[ty, tx] + (1.0 - a) * quad
+    return out
 
 
 def thin_occluder_mask(gray: np.ndarray, face_mask: np.ndarray, min_area_px: int = 150, dilate_px: int = 7) -> np.ndarray:

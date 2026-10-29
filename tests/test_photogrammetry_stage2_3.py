@@ -199,3 +199,8 @@ if __name__ == "__main__":
     print("  [PASS] test_stage2_3_end_to_end_on_real_sample")
 
     print("\n>>> ALL STAGE 2 & 3 TESTS PASSED SUCCESSFULLY! <<<")
+
+
+from tests._functional import function_tests  # noqa: E402
+
+load_tests = function_tests(globals())

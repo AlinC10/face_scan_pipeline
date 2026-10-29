@@ -189,3 +189,8 @@ if __name__ == "__main__":
 
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! <<<")
 
+
+
+from tests._functional import function_tests  # noqa: E402
+
+load_tests = function_tests(globals())

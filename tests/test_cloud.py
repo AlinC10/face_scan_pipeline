@@ -412,6 +412,7 @@ class TestPodJobEndToEnd(unittest.TestCase):
         self.assertEqual(calls[0]["spectacles"], False)
         self.assertNotIn("unknown_option", calls[0])
         self.assertEqual(Path(calls[0]["rig_dir"]).name, "rig")
+        self.assertEqual(calls[0]["reconstruction_mode"], "dense")
         names = zipfile.ZipFile(io.BytesIO(s3.objects[(BUCKET, r2.output_key("j9", "output.zip"))])).namelist()
         self.assertIn("logs/run_log.txt", names)
         self.assertIn("stats.json", names)
@@ -419,7 +420,8 @@ class TestPodJobEndToEnd(unittest.TestCase):
         self.assertIn((BUCKET, r2.output_key("j9", "run_log.txt")), s3.objects)
         self.assertIn((BUCKET, r2.output_key("j9", "started.json")), s3.objects)   # boot signal for the client
         stats = json.loads(s3.objects[(BUCKET, r2.output_key("j9", "stats.json"))])
-        self.assertEqual(stats["manifest"]["duration_s"], 1.0)
+        self.assertEqual(stats["pod"]["state"], "ok")
+        self.assertIn("pipeline", stats["pod"]["timings_s"])
 
     def test_pipeline_failure_and_missing_face_pair_are_reported(self):
         s3 = FakeS3()
@@ -477,12 +479,17 @@ class TestCloudScanTool(unittest.TestCase):
             self.tool.parse_set(["tag_scal=1.0"])             # typo: refused, not silently ignored in the pod
         self.assertEqual(self.tool.parse_set(["no_spectacles"]), {"spectacles": False})
 
-    def test_known_options_are_pipeline_parameters(self):
+    def test_known_options_are_job_config_keys(self):
+        """The pod accepts every JobConfig key except the local paths; cloud_scan reserves exactly those."""
+        from dataclasses import fields
         import inspect
-        import run_photogrammetry_runpod
-        params = set(inspect.signature(run_photogrammetry_runpod.run_photogrammetry_pipeline).parameters)
-        self.assertLessEqual(self.tool.PIPELINE_OPTIONS, params)
-        self.assertLessEqual(self.tool.RESERVED_OPTIONS - {"job_id"}, params)
+        import run_photogrammetry_runpod as rp_mod
+        keys = {f.name for f in fields(rp_mod.JobConfig)}
+        self.assertEqual(self.tool.PIPELINE_OPTIONS, keys - rp_mod.PATH_OPTIONS)
+        self.assertEqual(self.tool.RESERVED_OPTIONS - {"job_id"}, rp_mod.PATH_OPTIONS)
+        self.assertEqual(keys, set(inspect.signature(rp_mod.run_photogrammetry_pipeline).parameters))
+        with self.assertRaises(ValueError):
+            rp_mod.JobConfig.from_dict({"tag_scal": 1.0})
 
     def test_ctrl_c_cancels_the_job(self):
         seen = {}

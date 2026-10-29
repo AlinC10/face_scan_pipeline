@@ -11,7 +11,7 @@ Input (face_jobs/<id>/input/): rig/0 + rig/1 (face pair) and, optionally, calib/
 turntable_poses.py calibrates the rig on them; without them the calibration stored in the image is used).
 
 Writes to face_jobs/<id>/output/: output.zip, stats.json, run_log.txt and, LAST, status.json:
-  {"state": "ok" | "pipeline_error" | "input_error" | "timeout", ...}
+  {"state": "ok" | "ram_insufficient" | "pipeline_error" | "input_error" | "timeout", ...}
 The pod never stops itself (it has no RunPod key): the client terminates it after reading status.json.
 """
 
@@ -35,8 +35,11 @@ INPUT_DIR = Path(os.environ.get("POD_INPUT_DIR", "/workspace/input_images"))
 OUTPUT_DIR = Path(os.environ.get("POD_OUTPUT_DIR", "/workspace/output"))
 WATCHDOG_MARGIN_S = 180   # leave time to upload the log and status.json before the credentials expire
 
-# JOB_JSON keys passed on to run_photogrammetry_pipeline(); paths are set here, never by the client
-PIPELINE_OPTIONS = {"name", "spectacles", "tag_scale", "check_apriltags", "calibration_path"}
+# JOB_JSON keys passed on to run_pipeline(): every JobConfig key except the paths of this machine,
+# which are set here. Imported lazily (the module pulls the pipeline); kept in sync by a test.
+PIPELINE_OPTIONS = {"name", "spectacles", "tag_scale", "check_apriltags", "calibration_path", "export_scale",
+                    "glb_draco", "reconstruction_mode", "stop_after_stage", "rectify_native", "refine_with_features",
+                    "texture_size", "segment_face", "remove_frames", "head_model", "expression"}
 
 
 def describe_resources() -> dict:
@@ -133,7 +136,8 @@ def main() -> int:
         return 1
 
     # imported late: the download needs only boto3
-    from run_photogrammetry_runpod import run_photogrammetry_pipeline
+    from run_photogrammetry_runpod import run_pipeline
+    from photogrammetry.resources import InsufficientRamError
 
     options = {k: v for k, v in job.items() if k in PIPELINE_OPTIONS}
     unknown = sorted(set(job) - PIPELINE_OPTIONS - {"job_id"})
@@ -143,23 +147,30 @@ def main() -> int:
     status["options"] = options
     try:
         t0 = time.time()
-        summary = run_photogrammetry_pipeline(rig_dir=INPUT_DIR / "rig", output_dir=OUTPUT_DIR,
-                                              reconstruction_mode="dense", **options)
+        summary = run_pipeline({"reconstruction_mode": "dense", **options,
+                                "rig_dir": str(INPUT_DIR / "rig"), "output_dir": str(OUTPUT_DIR)})
         timings["pipeline"] = round(time.time() - t0, 2)
         if summary.get("status") != "success":
             raise RuntimeError(f"pipeline finished with status {summary.get('status')!r}")
         status.update(state="ok", calibration=summary.get("calibration", {}).get("source"))
+    except InsufficientRamError as e:
+        status.update(state="ram_insufficient", error=str(e),
+                      required_gb=round(e.required_gb, 2), available_gb=round(e.available_gb, 2))
     except Exception as e:
         status.update(state="pipeline_error", error=f"{type(e).__name__}: {e}",
                       traceback=traceback.format_exc()[-4000:])
     finally:
         timings["total"] = round(time.time() - started, 2)
         status["timings_s"] = timings
-        manifest_path = OUTPUT_DIR / "photogrammetry_manifest.json"
-        stats = {"job_id": job_id, "state": status["state"], "resources": status["resources"], "timings_s": timings}
-        if manifest_path.is_file():
-            stats["manifest"] = json.loads(manifest_path.read_text(encoding="utf-8"))
-        (OUTPUT_DIR / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        # stats.json of the pipeline (telemetry, schema v2) + what only the pod knows
+        stats_path = OUTPUT_DIR / "stats.json"
+        try:
+            stats = json.loads(stats_path.read_text(encoding="utf-8")) if stats_path.is_file() else {}
+        except ValueError:
+            stats = {}
+        stats["pod"] = {"job_id": job_id, "state": status["state"], "resources": status["resources"],
+                        "timings_s": timings}
+        stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
         logger.info(f"Job {job_id} finished: {status['state']}")
         log_handler.flush()
         if status["state"] == "ok":

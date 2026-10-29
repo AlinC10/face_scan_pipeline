@@ -61,6 +61,27 @@ class FaceSurfaceResult:
     landmarks_head: np.ndarray             # (468, 3) landmarks in the head frame
     grid_resolution_mm: float
     stats: Dict[str, float] = field(default_factory=dict)
+    smooth_mesh: Optional[trimesh.Trimesh] = None   # prior + robust correction S (no detail): texture visibility
+    measured_points: Optional[np.ndarray] = None    # (N, 3) head frame: final surface where a measurement is an inlier
+    measured_weights: Optional[np.ndarray] = None   # (N,) measurement weight of those cells
+    height_field: Optional[np.ndarray] = None       # (gh, gw) final z (mm), NaN outside the face
+    grid_lo: Optional[np.ndarray] = None            # head-frame (x, y) of column 0 / the last row
+    grid_hi: Optional[np.ndarray] = None            # head-frame (x, y): y of row 0, x of the last column
+
+    def sample_height(self, xy: np.ndarray) -> np.ndarray:
+        """Bilinear z of the height field at head-frame (x, y) points; NaN outside the face."""
+        res = self.grid_resolution_mm
+        col = (xy[:, 0] - self.grid_lo[0]) / res
+        row = (self.grid_hi[1] - xy[:, 1]) / res
+        z = self.height_field
+        h, w = z.shape
+        c0 = np.clip(np.floor(col).astype(int), 0, w - 2)
+        r0 = np.clip(np.floor(row).astype(int), 0, h - 2)
+        fc, fr = col - c0, row - r0
+        out = ((1 - fr) * ((1 - fc) * z[r0, c0] + fc * z[r0, c0 + 1])
+               + fr * ((1 - fc) * z[r0 + 1, c0] + fc * z[r0 + 1, c0 + 1]))
+        inside = (col >= 0) & (col <= w - 1) & (row >= 0) & (row <= h - 1)
+        return np.where(inside, out, np.nan)
 
 
 def triangulate_disparity(
@@ -167,10 +188,17 @@ def fuse_face_surface(
     rect_to_head = np.linalg.inv(head_to_rect)
     lm_head = _transform(rect_to_head, lm3d)
 
-    # --- Grid over the landmark extent in the head frame
+    # --- Grid over the landmark extent in the head frame, or over the (larger) segmented face region
     res = grid_resolution_mm
     lo = lm_head[inside, :2].min(0) - margin_mm
     hi = lm_head[inside, :2].max(0) + margin_mm
+    for est in estimates:
+        pts, wgt = triangulate_disparity(rect, est, disparity=est.smooth, valid=est.face_mask)
+        sel = wgt > 0
+        if sel.sum() > 1000:
+            ph = _transform(rect_to_head, pts[sel])
+            lo = np.minimum(lo, np.percentile(ph[:, :2], 0.2, axis=0) - margin_mm)
+            hi = np.maximum(hi, np.percentile(ph[:, :2], 99.8, axis=0) + margin_mm)
     gw, gh = (np.ceil((hi - lo) / res).astype(int) + 1)
 
     def to_grid(p):                      # head (x, y) -> grid (col, row); rows grow downwards
@@ -259,8 +287,18 @@ def fuse_face_surface(
         })
 
     mesh = _grid_mesh(z, lo, hi, res)
+    # The same surface without the measured detail, at 1 mm: occlusion tests on it do not flicker with the
+    # sub-millimetre detail (striped visibility maps in the texture).
+    smooth = cv2.resize(np.where(mask, z_prior + S, np.nan).astype(np.float32), None, fx=0.5, fy=0.5,
+                        interpolation=cv2.INTER_NEAREST)
+    smooth_mesh = _grid_mesh(smooth, lo, hi, 2 * res)
+    # Measured cells (for fitting the head model on data, not on the prior)
+    rows, cols = np.nonzero(inl & np.isfinite(z))
+    measured = np.stack([lo[0] + cols * res, hi[1] - rows * res, z[rows, cols]], axis=1)
     stats.update({"vertices": int(len(mesh.vertices)), "faces": int(len(mesh.faces))})
-    return FaceSurfaceResult(mesh, head_to_rect, lm_head, res, stats)
+    return FaceSurfaceResult(mesh, head_to_rect, lm_head, res, stats, smooth_mesh,
+                             measured_points=measured, measured_weights=meas_w[rows, cols],
+                             height_field=z.astype(np.float32), grid_lo=lo.copy(), grid_hi=hi.copy())
 
 
 def _hillshade(z: np.ndarray, res: float) -> np.ndarray:

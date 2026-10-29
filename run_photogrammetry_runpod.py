@@ -41,6 +41,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -114,6 +115,53 @@ except ImportError:
     )
 
 
+@dataclass
+class JobConfig:
+    """
+    One reconstruction job (as Turntable Studio's job dict): the keys of run_pipeline(job), of the CLI,
+    of runpod_job.py (JOB_JSON) and of tools/cloud_scan.py --set. The defaults below are the only ones.
+    """
+    rig_dir: Optional[str] = None
+    left_path: Optional[str] = None
+    right_path: Optional[str] = None
+    output_dir: str = "./output"
+    calib_dir: Optional[str] = None
+    calibration_path: Optional[str] = None
+    layout_path: Optional[str] = None
+    name: str = "model"
+    reconstruction_mode: str = "dense"
+    spectacles: bool = True
+    tag_scale: float = 0.98
+    export_scale: float = 100.0
+    glb_draco: bool = True
+    texture_size: int = 4096
+    segment_face: bool = True
+    remove_frames: Optional[bool] = None
+    head_model: str = "gnm"
+    expression: str = "capture"
+    check_apriltags: bool = True
+    stop_after_stage: int = 7
+    rectify_native: bool = False
+    refine_with_features: bool = True
+
+    @classmethod
+    def from_dict(cls, job: Dict[str, Any]) -> "JobConfig":
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(job) - known)
+        if unknown:
+            raise ValueError(f"Unknown job option(s) {unknown}; known: {sorted(known)}")
+        return cls(**job)
+
+
+# Options that are paths on the machine running the job (set by the pod / CLI, never sent by a cloud client)
+PATH_OPTIONS = {"rig_dir", "left_path", "right_path", "output_dir", "calib_dir", "layout_path"}
+
+
+def run_pipeline(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Runs one job given as a dict of JobConfig keys (unknown keys are refused, not ignored)."""
+    return run_photogrammetry_pipeline(**asdict(JobConfig.from_dict(job)))
+
+
 def _latest_pair(pairs: list) -> "StereoIngestionResult":
     """
     The most recent capture of a rig folder. The pairs are sorted by name as strings
@@ -136,11 +184,15 @@ def _job_rig_calibration(
     calibration_path: str | Path | None,
     out_dir: Path,
     tag_scale: float,
+    face_pair: tuple | None = None,
 ) -> tuple:
     """
-    Stereo calibration of this job. With photographs of the free AprilTag disc (calib/0 and calib/1 next to
-    rig/, or --calib-dir), turntable_poses.py runs on them and its turntable_calib.json is used. Without them
-    the stored calibration is used (--calib, otherwise assets/rig_calibration.json).
+    Stereo calibration of this job, in order of preference:
+      1. photographs of the free AprilTag disc (calib/0 and calib/1 next to rig/, or --calib-dir):
+         turntable_poses.py runs on them and its turntable_calib.json is used;
+      2. the disc tags visible in the face pair itself (photogrammetry/pair_calibration.py), accepted only
+         close to the stored calibration (focal 2 %, baseline 3 mm, rotation 1 deg);
+      3. the stored calibration (--calib, otherwise assets/rig_calibration.json).
     Returns (calibration file or None for the default, description for the manifest).
     """
     from photogrammetry.rig_calibration import DEFAULT_CALIBRATION_PATH
@@ -170,9 +222,104 @@ def _job_rig_calibration(
         return res.calib_path, {"source": "turntable_poses", **res.to_dict()}
 
     stored = Path(calibration_path) if calibration_path else DEFAULT_CALIBRATION_PATH
-    log.warning("No disc photographs for this job (calib/0, calib/1): turntable_poses.py not run, "
-                "using the stored calibration %s.", stored)
-    return calibration_path, {"source": "stored", "calib": str(stored)}
+    pair_reason = None
+    if face_pair is not None:
+        from photogrammetry.pair_calibration import calibrate_face_pair, save_calibration
+        from photogrammetry.rig_calibration import load_rig_calibration
+        res = calibrate_face_pair(face_pair[0], face_pair[1], load_rig_calibration(stored), tag_scale)
+        if res.accepted:
+            path = save_calibration(res.calibration, out_dir / "calibration" / "pair_calibration.json", res.stats)
+            log.info("Calibration from the disc tags of the face pair: %s", res.stats)
+            return path, {"source": "face_pair_tags", "calib": str(path), "base": str(stored), **res.stats}
+        pair_reason = res.reason
+    log.warning("No disc photographs for this job (calib/0, calib/1)%s: using the stored calibration %s.",
+                f" and the face pair cannot calibrate the rig ({pair_reason})" if pair_reason else "", stored)
+    info = {"source": "stored", "calib": str(stored)}
+    if pair_reason:
+        info["face_pair_tags"] = pair_reason
+    return calibration_path, info
+
+
+def _run_dense(ingestion_res, summary_report, out_dir, rig_dir, left_path, calib_dir, calibration_path,
+               name, spectacles, tag_scale, export_scale, glb_draco, texture_size,
+               segment_face=True, remove_frames=None, head_model="gnm", expression="capture") -> Dict[str, Any]:
+    """
+    Dense two-view face reconstruction with telemetry (as Turntable Studio): RAM check first, every stage a
+    measured step, stats.json (schema v2) with the hardware, the steps, the face quality metrics and the
+    exported meshes, written also when the run fails (outcome + failed step).
+    """
+    from photogrammetry import run_metrics
+    from photogrammetry.face_pipeline import FacePipelineConfig, reconstruct_face_pair
+    from photogrammetry.resources import check_ram, describe_resources
+    from photogrammetry.telemetry import SystemTelemetry
+
+    telemetry = SystemTelemetry(output_dir=str(out_dir))
+    telemetry.start_sampling(interval_sec=0.25)
+    telemetry.watch(str(out_dir))
+    telemetry.set_info(
+        version=run_metrics.code_version(),
+        hardware={"cpu": run_metrics.cpu_info(), "host": run_metrics.host_info()},
+        resources=describe_resources(),
+        inputs={"left": ingestion_res.cam0_meta.path, "right": ingestion_res.cam1_meta.path,
+                "image_size": [ingestion_res.cam0_meta.width, ingestion_res.cam0_meta.height],
+                "z_rig_mm": ingestion_res.z_rig_mm if ingestion_res.has_metric_z_prior else None},
+        options={"spectacles": spectacles, "tag_scale": tag_scale, "export_scale": export_scale,
+                 "glb_draco": glb_draco, "texture_size": texture_size, "segment_face": segment_face,
+                 "remove_frames": remove_frames, "head_model": head_model, "expression": expression},
+    )
+    stats_path = out_dir / "stats.json"
+    try:
+        # A pod that is too small answers in seconds (runpod_job reports ram_insufficient, cloud/job retries)
+        ram = check_ram(ingestion_res.cam0_meta.width, ingestion_res.cam0_meta.height, texture_size,
+                        margin=float(os.environ.get("RAM_MARGIN", "1.0")))
+        telemetry.set_info(ram_check=ram)
+        log.info("RAM check: %.1f GB needed, %.1f GB available (%s)", ram["required_gb"], ram["available_gb"],
+                 ram["status"])
+
+        with telemetry.step("Calibration (turntable_poses, face-pair tags or stored)"):
+            job_calibration, calibration_info = _job_rig_calibration(
+                rig_dir, left_path, calib_dir, calibration_path, out_dir, tag_scale,
+                face_pair=(ingestion_res.cam0_meta.path, ingestion_res.cam1_meta.path),
+            )
+        summary_report["calibration"] = calibration_info
+        if calibration_info.get("report"):
+            telemetry.set_info(pose_quality=run_metrics.pose_quality(calibration_info["report"]))
+
+        log.info("=" * 70)
+        log.info("ETAPA 2-7: RECONSTRUCȚIE DENSĂ DIN DOUĂ VEDERI (CALIBRARE RIG + MEDIAPIPE + DIS)")
+        log.info("=" * 70)
+        face_res = reconstruct_face_pair(
+            ingestion_res.cam0_meta.path,
+            ingestion_res.cam1_meta.path,
+            out_dir,
+            FacePipelineConfig(calibration_path=job_calibration, name=name, spectacles=spectacles,
+                               calibration_info=calibration_info, tag_scale=tag_scale,
+                               export_scale=export_scale, glb_draco=glb_draco,
+                               high_texture_size=int(texture_size),
+                               low_texture_size=int(min(2048, texture_size)),
+                               segment_face=segment_face, remove_frames=remove_frames,
+                               head_model=head_model, expression=expression),
+            telemetry=telemetry,
+        )
+        telemetry.set_info(face=run_metrics.face_metrics(face_res.manifest))
+        for key, path in face_res.deliverables.items():
+            if key.split("_")[0] in ("obj", "stl", "3mf"):
+                telemetry.record_mesh(str(path))
+        telemetry.set_outcome("ok")
+    except Exception as e:
+        telemetry.set_outcome("error", error_type=type(e).__name__, error=str(e)[:500],
+                              failed_step=telemetry.current_step)
+        raise
+    finally:
+        telemetry.stop_sampling()
+        telemetry.save_json(str(stats_path))
+
+    summary_report["stages_completed"].append("stage_2_7_dense_two_view_face")
+    summary_report["artifacts"].update({k: str(v) for k, v in face_res.deliverables.items()})
+    summary_report["artifacts"]["stats"] = str(stats_path)
+    summary_report["status"] = "success"
+    summary_report["manifest"] = str(face_res.manifest_path)
+    return summary_report
 
 
 def run_photogrammetry_pipeline(
@@ -182,7 +329,7 @@ def run_photogrammetry_pipeline(
     output_dir: str | Path = "./output",
     check_apriltags: bool = True,
     layout_path: str | Path | None = None,
-    tag_scale: float = 1.0,
+    tag_scale: float = 0.98,
     name: str = "model",
     stop_after_stage: int = 7,
     rectify_native: bool = False,
@@ -191,6 +338,13 @@ def run_photogrammetry_pipeline(
     calibration_path: str | Path | None = None,
     spectacles: bool = True,
     calib_dir: str | Path | None = None,
+    export_scale: float = 100.0,
+    glb_draco: bool = True,
+    texture_size: int = 4096,
+    segment_face: bool = True,
+    remove_frames: Optional[bool] = None,
+    head_model: str = "gnm",
+    expression: str = "capture",
 ) -> Dict[str, Any]:
     """
     Executes the multi-stage photogrammetry pipeline.
@@ -272,28 +426,9 @@ def run_photogrammetry_pipeline(
     # disparitate din ambele vederi, fuziune metrică, textură din pozele 12.3MP
     # =========================================================================
     if reconstruction_mode == "dense":
-        from photogrammetry.face_pipeline import FacePipelineConfig, reconstruct_face_pair
-
-        job_calibration, calibration_info = _job_rig_calibration(
-            rig_dir, left_path, calib_dir, calibration_path, out_dir, tag_scale,
-        )
-        summary_report["calibration"] = calibration_info
-
-        log.info("=" * 70)
-        log.info("ETAPA 2-7: RECONSTRUCȚIE DENSĂ DIN DOUĂ VEDERI (CALIBRARE RIG + MEDIAPIPE + DIS)")
-        log.info("=" * 70)
-        face_res = reconstruct_face_pair(
-            ingestion_res.cam0_meta.path,
-            ingestion_res.cam1_meta.path,
-            out_dir,
-            FacePipelineConfig(calibration_path=job_calibration, name=name, spectacles=spectacles,
-                               calibration_info=calibration_info),
-        )
-        summary_report["stages_completed"].append("stage_2_7_dense_two_view_face")
-        summary_report["artifacts"].update({k: str(v) for k, v in face_res.deliverables.items()})
-        summary_report["status"] = "success"
-        summary_report["manifest"] = str(face_res.manifest_path)
-        return summary_report
+        return _run_dense(ingestion_res, summary_report, out_dir, rig_dir, left_path, calib_dir, calibration_path,
+                          name, spectacles, tag_scale, export_scale, glb_draco, texture_size,
+                          segment_face, remove_frames, head_model, expression)
 
     # =========================================================================
     # ETAPA 2: RECTIFICARE STEREO BOUGUET & MASCARE FACIALĂ
@@ -739,6 +874,7 @@ def run_photogrammetry_pipeline(
 
 
 def main():
+    D = JobConfig()
     parser = argparse.ArgumentParser(
         description="RunPod Photogrammetry Pipeline (Etapele 1, 2, 3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -777,12 +913,12 @@ Examples:
     parser.add_argument(
         "-o",
         "--output-dir",
-        default="./output",
+        default=D.output_dir,
         help="Directory to save photogrammetry deliverables (default: ./output)",
     )
     parser.add_argument(
         "--name",
-        default="model",
+        default=D.name,
         help="Prefix name for the model and output files (default: model)",
     )
     parser.add_argument(
@@ -798,20 +934,21 @@ Examples:
     parser.add_argument(
         "--tag-scale",
         type=float,
-        default=1.0,
-        help="Print scale factor for AprilTags (default: 1.0 = exact print)",
+        default=D.tag_scale,
+        help="Print scale of the AprilTag disc: measured / designed size (default 0.98: this rig's disc came out at "
+             "~98 %%, disc 255 mm, tags 0-6 196 mm, as in Turntable Studio). Corrects the metric scale once",
     )
     parser.add_argument(
         "--stop-after-stage",
         type=int,
-        default=7,
+        default=D.stop_after_stage,
         choices=[1, 2, 3, 4, 5, 6, 7],
         help="Stage after which to terminate execution (1 to 7; default: 7)",
     )
     parser.add_argument(
         "--mode",
         dest="reconstruction_mode",
-        default="dense",
+        default=D.reconstruction_mode,
         choices=["dense", "hybrid", "poisson"],
         help="Reconstruction algorithm: 'dense' (calibrated rig + MediaPipe-guided dense two-view stereo, "
              "recommended), 'hybrid' (MediaPipe prior + Laplacian fitting) or 'poisson' (classical SGBM + Poisson)",
@@ -821,6 +958,49 @@ Examples:
         default=None,
         help="Stereo rig calibration for --mode dense: assets/rig_calibration.json (default) "
              "or a turntable_calib.json from turntable_poses.py",
+    )
+    parser.add_argument(
+        "--export-scale",
+        type=float,
+        default=D.export_scale,
+        help="--mode dense: metres -> export units, the same in OBJ / GLB / STL / 3MF (default 100: centimetres, "
+             "as Turntable Studio; 1000 = millimetres)",
+    )
+    parser.add_argument(
+        "--texture-size",
+        type=int,
+        default=D.texture_size,
+        help="--mode dense: high atlas size in px (default 4096; the low atlas is min(2048, this)). "
+             "RAM scales with its square: ~9 GB at 4096, ~3 GB at 2048",
+    )
+    parser.add_argument(
+        "--head-model",
+        default=D.head_model,
+        choices=["gnm", "none"],
+        help="--mode dense: 'gnm' = whole head (GNM Head v3 fitted to the measured face + its detail; animatable "
+             "low GLB), 'none' = the measured face only",
+    )
+    parser.add_argument(
+        "--neutral-expression",
+        action="store_true",
+        help="--mode dense with --head-model gnm: neutral expression in the deliverables (identity and detail kept)",
+    )
+    parser.add_argument(
+        "--no-segmentation",
+        action="store_true",
+        help="--mode dense: face region = MediaPipe mesh outline (instead of the segmented face skin up to the "
+             "hairline and the lateral cheeks)",
+    )
+    parser.add_argument(
+        "--keep-frames",
+        action="store_true",
+        help="--mode dense: keep the spectacle frames in the texture (by default they are painted out when "
+             "spectacles are expected)",
+    )
+    parser.add_argument(
+        "--no-glb-draco",
+        action="store_true",
+        help="--mode dense: do not Draco-compress the GLB geometry",
     )
     parser.add_argument(
         "--calib-dir",
@@ -843,24 +1023,31 @@ Examples:
     )
 
     args = parser.parse_args()
-
+    job = {
+        "rig_dir": args.rig_dir,
+        "left_path": args.left,
+        "right_path": args.right,
+        "output_dir": args.output_dir,
+        "check_apriltags": not args.no_apriltags,
+        "layout_path": args.layout,
+        "tag_scale": args.tag_scale,
+        "name": args.name,
+        "stop_after_stage": args.stop_after_stage,
+        "rectify_native": args.rectify_native,
+        "reconstruction_mode": args.reconstruction_mode,
+        "calibration_path": args.calib,
+        "spectacles": args.spectacles,
+        "calib_dir": args.calib_dir,
+        "export_scale": args.export_scale,
+        "glb_draco": not args.no_glb_draco,
+        "texture_size": args.texture_size,
+        "segment_face": not args.no_segmentation,
+        "remove_frames": False if args.keep_frames else None,
+        "head_model": args.head_model,
+        "expression": "neutral" if args.neutral_expression else "capture",
+    }
     try:
-        run_photogrammetry_pipeline(
-            rig_dir=args.rig_dir,
-            left_path=args.left,
-            right_path=args.right,
-            output_dir=args.output_dir,
-            check_apriltags=not args.no_apriltags,
-            layout_path=args.layout,
-            tag_scale=args.tag_scale,
-            name=args.name,
-            stop_after_stage=args.stop_after_stage,
-            rectify_native=args.rectify_native,
-            reconstruction_mode=args.reconstruction_mode,
-            calibration_path=args.calib,
-            spectacles=args.spectacles,
-            calib_dir=args.calib_dir,
-        )
+        run_pipeline(job)
     except Exception as e:
         log.error("Pipeline failure: %s", e, exc_info=True)
         sys.exit(1)

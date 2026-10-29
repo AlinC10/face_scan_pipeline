@@ -19,6 +19,7 @@ def convert_to_glb_draco(
     mesh: trimesh.Trimesh,
     output_glb_path: Union[str, Path],
     draco_compression_level: int = 7,
+    draco: bool = True,
 ) -> Path:
     """
     Combined pipeline helper:
@@ -31,8 +32,9 @@ def convert_to_glb_draco(
     out_path = Path(output_glb_path).resolve()
     # 1. Generate standard GLB
     convert_to_glb(mesh, out_path)
-    # 2. Apply Draco compression hook
-    apply_draco_compression(out_path, out_path, compression_level=draco_compression_level)
+    # 2. Draco compression of the geometry (kept uncompressed if DracoPy is missing or encoding fails)
+    if draco:
+        apply_draco_compression(out_path, out_path, compression_level=draco_compression_level)
     return out_path
 
 

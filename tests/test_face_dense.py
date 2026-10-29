@@ -141,3 +141,8 @@ def test_bake_albedo_two_synthetic_cameras():
     assert stats["texels_seen_fraction"] > 0.95
     seen = tex.sum(axis=2) > 0
     assert abs(float(np.median(tex[..., 1][seen])) - 150.0) < 3.0
+
+
+from tests._functional import function_tests  # noqa: E402
+
+load_tests = function_tests(globals())

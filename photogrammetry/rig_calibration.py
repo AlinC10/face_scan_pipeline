@@ -10,6 +10,12 @@ Calibration sources (in order of preference):
   2. A `turntable_calib.json` written by turntable_poses.py (Turntable Studio):
      the relative pose is derived from the two locked camera poses on the disc.
 
+Tag scale: the AprilTag disc of the rig came out of the printer at ~98 % (disc 255 mm instead of 260,
+tags 0-6 196 mm instead of 200; Turntable Studio measurement). Every calibration records the print scale
+it was computed with (`tag_scale`, 1.0 when the nominal layout was used); `with_tag_scale()` rescales the
+baseline to another print scale. Only the metric scale changes (intrinsics and rotations do not), so the
+correction is applied once, on the baseline, and every millimetre downstream is real.
+
 Why refine: the turntable model is fitted on tags that only appear in the lower
 part of the frame, so a residual rotation of a few tenths of a degree remains
 (≈ 7 px of vertical parallax at 12.3 MP). Dense stereo needs < 1 px. The
@@ -53,6 +59,7 @@ class RigCalibration:
     image_size: Tuple[int, int] = (4056, 3040)
     source: str = ""
     refinement: Dict[str, float] = field(default_factory=dict)
+    tag_scale: float = 1.0     # print scale of the tag disc this calibration was computed with
 
     @property
     def baseline_mm(self) -> float:
@@ -69,7 +76,7 @@ class RigCalibration:
             K0=S @ self.K0, D0=self.D0.copy(), K1=S @ self.K1, D1=self.D1.copy(),
             R=self.R.copy(), T_mm=self.T_mm.copy(),
             image_size=(int(round(self.image_size[0] * scale)), int(round(self.image_size[1] * scale))),
-            source=self.source, refinement=dict(self.refinement),
+            source=self.source, refinement=dict(self.refinement), tag_scale=self.tag_scale,
         )
 
     def with_pose(self, R: np.ndarray, T_mm: np.ndarray) -> "RigCalibration":
@@ -77,7 +84,20 @@ class RigCalibration:
             K0=self.K0.copy(), D0=self.D0.copy(), K1=self.K1.copy(), D1=self.D1.copy(),
             R=np.asarray(R, dtype=np.float64), T_mm=np.asarray(T_mm, dtype=np.float64).reshape(3),
             image_size=self.image_size, source=self.source, refinement=dict(self.refinement),
+            tag_scale=self.tag_scale,
         )
+
+    def with_tag_scale(self, tag_scale: float) -> "RigCalibration":
+        """
+        The calibration for a tag disc printed at `tag_scale` (measured / designed size). The tag
+        coordinates set the metric scale, so the baseline scales by tag_scale / self.tag_scale.
+        """
+        tag_scale = float(tag_scale)
+        if tag_scale <= 0:
+            raise ValueError(f"tag_scale must be positive, got {tag_scale}")
+        out = self.with_pose(self.R, self.T_mm * (tag_scale / self.tag_scale))
+        out.tag_scale = tag_scale
+        return out
 
     def to_dict(self) -> Dict:
         return {
@@ -88,6 +108,7 @@ class RigCalibration:
             "R_1_0": self.R.tolist(),
             "T_1_0_mm": self.T_mm.tolist(),
             "baseline_mm": round(self.baseline_mm, 3),
+            "tag_scale": self.tag_scale,
             "relative_rotation_deg": round(self.relative_rotation_deg, 3),
             "refinement": self.refinement,
         }
@@ -109,7 +130,9 @@ def _from_turntable_calib(data: Dict, path: Path) -> RigCalibration:
     T = (-Rs[1] @ Cs[1]) - R @ (-Rs[0] @ Cs[0])
     w = int(data.get("intrinsics", {}).get("0", {}).get("width", 4056))
     h = int(data.get("intrinsics", {}).get("0", {}).get("height", 3040))
-    return RigCalibration(Ks[0], Ds[0], Ks[1], Ds[1], R, T * 1000.0, (w, h), source=f"turntable_poses: {path}")
+    # turntable_poses.py does not record --tagScale in its output; turntable_calibration.py adds it.
+    return RigCalibration(Ks[0], Ds[0], Ks[1], Ds[1], R, T * 1000.0, (w, h), source=f"turntable_poses: {path}",
+                          tag_scale=float(data.get("tag_scale", 1.0)))
 
 
 def load_rig_calibration(path: Optional[Union[str, Path]] = None) -> RigCalibration:
@@ -129,10 +152,11 @@ def load_rig_calibration(path: Optional[Union[str, Path]] = None) -> RigCalibrat
             T_mm=np.asarray(data["T_1_0_mm"], dtype=np.float64).reshape(3),
             image_size=tuple(data.get("image_size", (4056, 3040))),
             source=data.get("source", str(p)),
+            tag_scale=float(data.get("tag_scale", 1.0)),
         )
     log.info(
-        "Rig calibration loaded (%s): B = %.2f mm, relative rotation = %.2f deg, f = %.1f / %.1f px",
-        calib.source, calib.baseline_mm, calib.relative_rotation_deg, calib.K0[0, 0], calib.K1[0, 0],
+        "Rig calibration loaded (%s): B = %.2f mm (tag scale %.3f), relative rotation = %.2f deg, f = %.1f / %.1f px",
+        calib.source, calib.baseline_mm, calib.tag_scale, calib.relative_rotation_deg, calib.K0[0, 0], calib.K1[0, 0],
     )
     return calib
 

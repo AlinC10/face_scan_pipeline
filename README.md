@@ -95,7 +95,9 @@ Scriptul [`reconstruct_3d.py`](reconstruct_3d.py) (apelat prin `./run_reconstruc
 
 Scriptul [`run_photogrammetry_runpod.py`](run_photogrammetry_runpod.py) (și containerul Docker) rulează implicit
 pipeline-ul dens din [`photogrammetry/face_pipeline.py`](photogrammetry/face_pipeline.py). Rulează pe CPU
-(~3 min pentru o pereche 12.3 MP, vârf de RAM 8.9 GB) și nu are nevoie de GPU.
+(~3 min pentru o pereche 12.3 MP, vârf de RAM 9.7 GB cu atlas 4096; ~4.4 GB pe o pereche la jumătate cu
+`--texture-size 2048`) și nu are nevoie de GPU. Înainte de start, RAM-ul necesar e estimat
+([`photogrammetry/resources.py`](photogrammetry/resources.py)); dacă nu ajunge, jobul se oprește imediat.
 
 Structura unui job: perechea facială în `rig/0` și `rig/1`, iar opțional pozele discului AprilTag liber în
 `calib/0` și `calib/1` (numite ca la scanarea de obiecte: `f_<nivel><pas:03d>.jpg`, ex. `f_1000.jpg` … `f_1019.jpg`).
@@ -107,7 +109,13 @@ python run_photogrammetry_runpod.py --rig-dir input_images/rig -o output/   # + 
 python run_photogrammetry_runpod.py --rig-dir input_images/rig --calib cale/turntable_calib.json -o output/
 # subiect fără ochelari (sprâncenele, genele și pleoapele sunt măsurate ca suprafață):
 python run_photogrammetry_runpod.py --rig-dir input_images/rig --no-spectacles -o output/
+# doar fața (fără capul GNM), expresie neutră, atlas mai mic:
+python run_photogrammetry_runpod.py --rig-dir input_images/rig --head-model none -o output/
+python run_photogrammetry_runpod.py --rig-dir input_images/rig --neutral-expression --texture-size 2048 -o output/
 ```
+
+Alte opțiuni: `--no-segmentation` (fără masca MediaPipe SelfieMulticlass a feței), `--keep-frames` (ramele
+ochelarilor rămân în textură), `--export-scale` (implicit 100: 1 mm → 0.1 unități, ca Turntable Studio).
 
 1. **Calibrarea rig-ului** ([`photogrammetry/turntable_calibration.py`](photogrammetry/turntable_calibration.py),
    [`photogrammetry/rig_calibration.py`](photogrammetry/rig_calibration.py)): în perechea facială discul nu se vede
@@ -131,13 +139,22 @@ python run_photogrammetry_runpod.py --rig-dir input_images/rig --no-spectacles -
    cu unghiul de vizare, devin un câmp de înălțimi în sistemul capului (aliniere Umeyama cu fața canonică) la 0.5 mm;
    corecția robustă a priorului + detaliul măsurat; în spatele lentilelor doar corecția netedă
    (cu `--no-spectacles`: doar în deschiderea ochilor).
-5. **Mesh-uri**: high = grila de 0.5 mm (~150k fețe), low = decimare QEM la 20k fețe; atlase UV xatlas.
-6. **Textură** ([`photogrammetry/face_texture.py`](photogrammetry/face_texture.py)): din pozele originale 12.3 MP,
+5. **Capul întreg GNM Head v3** ([`photogrammetry/gnm_head.py`](photogrammetry/gnm_head.py),
+   [`gnm_fit.py`](photogrammetry/gnm_fit.py), [`gnm_assembly.py`](photogrammetry/gnm_assembly.py); implicit,
+   `--head-model none` = doar fața): modelul Google (53 MB, descărcat cu SHA-256 verificat în `assets/gnm_head.npz`)
+   se potrivește pe suprafața măsurată + reperele MediaPipe (RMS ~1 mm). high = GNM subdivizat cu detaliul stereo
+   pe normală (~200k fețe), low = topologia GNM (~25k fețe) cu UV-ul lui. Dacă fit-ul depășește 2 mm RMS se
+   revine la fața simplă. `--neutral-expression` păstrează identitatea și scoate expresia din captură.
+6. **Mesh-uri doar față** (`--head-model none`): high = grila de 0.5 mm (~150k fețe), low = decimare QEM la 20k fețe; atlase UV xatlas.
+7. **Textură** ([`photogrammetry/face_texture.py`](photogrammetry/face_texture.py)): din pozele originale 12.3 MP,
    cu vizibilitate (z-buffer per cameră), ponderi $\cos^3\theta$, echilibrare de culoare între camere și amestec pe
    două benzi (frecvențe joase mediate, detaliul din camera cea mai frontală); hartă de normale tangent-space
    a mesh-ului high coaptă pe atlasul low.
-7. **Livrabile**: OBJ/GLB în metri, STL/3MF în mm ca solid închis (fața + placă spate), plus
-   `photogrammetry_manifest.json` și imagini de control în `output/debug/`.
+8. **Livrabile**: OBJ / GLB / STL / 3MF la aceeași scară (`export_scale` × `tag_scale` din calibrare), STL/3MF
+   solid etanș (bust tăiat la 35 mm sub bărbie; fața + placă spate fără GNM), GLB high cu Draco, GLB low animabil
+   (schelet gât/cap/ochi + 13 morph targets: expresii semantice GNM, pentru Blender / three.js), `object.json`
+   (dimensiuni în mm, IPD), `stats.json` (telemetrie), `photogrammetry_manifest.json` și imagini în `output/debug/`.
+   Verificare: `python tools/check_deliverables.py output/`; previzualizare: `python tools/render_preview.py`.
 
 Modurile vechi rămân disponibile: `--mode poisson` (SGBM + Poisson) și `--mode hybrid`.
 
